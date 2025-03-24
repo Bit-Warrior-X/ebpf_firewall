@@ -8,7 +8,7 @@
 #include <bpf/bpf.h>
 
 int main(int argc, char **argv) {
-    const char *ifname = "ens38";  // Replace with your interface name if needed
+    const char *ifname = "enp1s0";  // Replace with your interface name if needed
     int ifindex, err;
     struct bpf_object *obj;
     struct bpf_program *prog_main, *prog_parse_syn, *prog_parse_ack;
@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
     // Find program sections.
     prog_main = bpf_object__find_program_by_name(obj, "xdp_main");
     prog_parse_syn = bpf_object__find_program_by_name(obj, "xdp_parse_syn");
-    prog_parse_ack = bpf_object__find_program_by_name(obj, "xdp_parse_ack");
+    prog_parse_ack = bpf_object__find_program_by_name(obj, "xdp_parse_ack_rst");
     if (!prog_main || !prog_parse_syn || !prog_parse_ack) {
         fprintf(stderr, "ERROR: could not find all program sections\n");
         goto cleanup;
@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
     prog_array_map_fd = bpf_map__fd(map);
     
     // Update the prog_array map:
-    // Key 0 -> xdp_parse_syn; Key 1 -> xdp_parse_ack.
+    // Key 0 -> xdp_parse_syn; Key 1 -> xdp_parse_ack_rst.
     int key0 = 0, key1 = 1;
     err = bpf_map_update_elem(prog_array_map_fd, &key0, &prog_parse_syn_fd, 0);
     if (err) {

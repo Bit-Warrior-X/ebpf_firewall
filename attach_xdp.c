@@ -230,6 +230,30 @@ static int load_config(struct bpf_object *obj) {
         .ack_fixed_check_duration = ACK_FIXED_CHECK_DURATION_NS,
     };
 
+    struct rst_config rst_cfg = {
+        .rst_threshold = RST_THRESHOLD,
+        .burst_pkt_threshold = RST_BURST_PKT_THRESHOLD,
+        .burst_count_threshold = RST_BURST_COUNT_THRESHOLD,
+        .rst_fixed_threshold = RST_FIXED_THRESHOLD,
+        .rst_fixed_check_duration = RST_FIXED_CHECK_DURATION_NS,
+    };
+
+    struct icmp_config icmp_cfg = {
+        .icmp_threshold = ICMP_THRESHOLD,
+        .burst_pkt_threshold = ICMP_BURST_PKT_THRESHOLD,
+        .burst_count_threshold = ICMP_BURST_COUNT_THRESHOLD,
+        .icmp_fixed_threshold = ICMP_FIXED_THRESHOLD,
+        .icmp_fixed_check_duration = ICMP_FIXED_CHECK_DURATION_NS,
+    };
+
+    struct udp_config udp_cfg = {
+        .udp_threshold = UDP_THRESHOLD,
+        .burst_pkt_threshold = UDP_BURST_PKT_THRESHOLD,
+        .burst_count_threshold = UDP_BURST_COUNT_THRESHOLD,
+        .udp_fixed_threshold = UDP_FIXED_THRESHOLD,
+        .udp_fixed_check_duration = UDP_FIXED_CHECK_DURATION_NS,
+    };
+
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), fp)) {
         // Skip comments and empty lines
@@ -265,7 +289,7 @@ static int load_config(struct bpf_object *obj) {
                 else if (strcmp(str_value, "hw") == 0)
                     attach_mode = XDP_FLAGS_HW_MODE;
                 else {
-                    fprintf(stderr,"Unknow attach_mode\n");
+                    fprintf(stderr,"Unkown attach_mode\n");
                     return -1;
                 }
                 continue;
@@ -308,9 +332,44 @@ static int load_config(struct bpf_object *obj) {
             } else if (strcmp(key, "ack_fixed_check_duration") == 0) {
                 ack_cfg.ack_fixed_check_duration = int_value * ONE_SECOND_NS;
             } 
-            
+            //RST config
+            else if (strcmp(key, "rst_threshold") == 0) {
+                rst_cfg.rst_threshold = int_value;
+            } else if (strcmp(key, "rst_burst_pkt") == 0) {
+                rst_cfg.burst_pkt_threshold = int_value;
+            } else if (strcmp(key, "rst_burst_count_per_sec") == 0) {
+                rst_cfg.burst_count_threshold = int_value;
+            } else if (strcmp(key, "rst_fixed_threshold") == 0) {
+                rst_cfg.rst_fixed_threshold = int_value;
+            } else if (strcmp(key, "rst_fixed_check_duration") == 0) {
+                rst_cfg.rst_fixed_check_duration = int_value * ONE_SECOND_NS;
+            } 
+            //ICMP config
+            else if (strcmp(key, "icmp_threshold") == 0) {
+                icmp_cfg.icmp_threshold = int_value;
+            } else if (strcmp(key, "icmp_burst_pkt") == 0) {
+                rst_cfg.burst_pkt_threshold = int_value;
+            } else if (strcmp(key, "icmp_burst_count_per_sec") == 0) {
+                rst_cfg.burst_count_threshold = int_value;
+            } else if (strcmp(key, "icmp_fixed_threshold") == 0) {
+                rst_cfg.rst_fixed_threshold = int_value;
+            } else if (strcmp(key, "icmp_fixed_check_duration") == 0) {
+                rst_cfg.rst_fixed_check_duration = int_value * ONE_SECOND_NS;
+            } 
+            //UDP config
+            else if (strcmp(key, "udp_threshold") == 0) {
+                udp_cfg.udp_threshold = int_value;
+            } else if (strcmp(key, "udp_burst_pkt") == 0) {
+                udp_cfg.burst_pkt_threshold = int_value;
+            } else if (strcmp(key, "udp_burst_count_per_sec") == 0) {
+                udp_cfg.burst_count_threshold = int_value;
+            } else if (strcmp(key, "udp_fixed_threshold") == 0) {
+                udp_cfg.udp_fixed_threshold = int_value;
+            } else if (strcmp(key, "udp_fixed_check_duration") == 0) {
+                udp_cfg.udp_fixed_check_duration = int_value * ONE_SECOND_NS;
+            } 
             else {
-                fprintf(stderr,"Unknow %s directive\n", key);
+                fprintf(stderr,"Unkown %s directive\n", key);
                 return -1;
             }
         }
@@ -320,6 +379,7 @@ static int load_config(struct bpf_object *obj) {
     // Calculate burst gap
     syn_cfg.burst_gap_ns = 1000000000ULL / (syn_cfg.burst_count_threshold);
     ack_cfg.burst_gap_ns = 1000000000ULL / (ack_cfg.burst_count_threshold);
+    rst_cfg.burst_gap_ns = 1000000000ULL / (rst_cfg.burst_count_threshold);
 
     // Update SYN config map
     int syn_map_fd = bpf_object__find_map_fd_by_name(obj, "syn_config_map");
@@ -356,8 +416,8 @@ int main(int argc, char **argv) {
     
     int ifindex, err;
     struct bpf_object *obj;
-    struct bpf_program *prog_main, *prog_parse_syn, *prog_parse_ack;
-    int prog_main_fd, prog_parse_syn_fd, prog_parse_ack_fd;
+    struct bpf_program *prog_main, *prog_parse_syn, *prog_parse_ack, *prog_parse_rst, *prog_parse_icmp, *prog_parse_udp;
+    int attach_id = -1, prog_main_fd, prog_parse_syn_fd, prog_parse_ack_fd, prog_parse_rst_fd, prog_parse_icmp_fd, prog_parse_udp_fd;
     int prog_array_map_fd;
     struct perf_buffer *pb = NULL;
     
@@ -390,7 +450,11 @@ int main(int argc, char **argv) {
     prog_main = bpf_object__find_program_by_name(obj, "xdp_main");
     prog_parse_syn = bpf_object__find_program_by_name(obj, "xdp_parse_syn");
     prog_parse_ack = bpf_object__find_program_by_name(obj, "xdp_parse_ack");
-    if (!prog_main || !prog_parse_syn || !prog_parse_ack) {
+    prog_parse_rst = bpf_object__find_program_by_name(obj, "xdp_parse_rst");
+    prog_parse_icmp = bpf_object__find_program_by_name(obj, "xdp_parse_icmp");
+    prog_parse_udp = bpf_object__find_program_by_name(obj, "xdp_parse_udp");
+
+    if (!prog_main || !prog_parse_syn || !prog_parse_ack || !prog_parse_rst || !prog_parse_icmp || !prog_parse_udp) {
         fprintf(stderr, "ERROR: could not find all program sections\n");
         goto cleanup;
     }
@@ -399,6 +463,9 @@ int main(int argc, char **argv) {
     prog_main_fd = bpf_program__fd(prog_main);
     prog_parse_syn_fd = bpf_program__fd(prog_parse_syn);
     prog_parse_ack_fd = bpf_program__fd(prog_parse_ack);
+    prog_parse_rst_fd = bpf_program__fd(prog_parse_rst);
+    prog_parse_icmp_fd = bpf_program__fd(prog_parse_icmp);
+    prog_parse_udp_fd = bpf_program__fd(prog_parse_udp);
     
     // Find the prog_array map (declared as "prog_array" in our BPF program).
     struct bpf_map *map = bpf_object__find_map_by_name(obj, "prog_array");
@@ -409,8 +476,9 @@ int main(int argc, char **argv) {
     prog_array_map_fd = bpf_map__fd(map);
     
     // Update the prog_array map:
-    // Key 0 -> xdp_parse_syn; Key 1 -> xdp_parse_ack_rst.
-    int key0 = 0, key1 = 1;
+    // Key 0 -> xdp_parse_syn; Key 1 -> xdp_parse_ack.
+    // Key 2 -> xdp_parse_rst; Key 3 -> xdp_parse_icmp. Key 4 -> xdp_parse_udp.
+    int key0 = 0, key1 = 1, key2 = 2, key3 = 3, key4 = 4;
     err = bpf_map_update_elem(prog_array_map_fd, &key0, &prog_parse_syn_fd, 0);
     if (err) {
         fprintf(stderr, "ERROR: updating prog_array key 0 failed: %d\n", err);
@@ -421,10 +489,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR: updating prog_array key 1 failed: %d\n", err);
         goto cleanup;
     }
+    err = bpf_map_update_elem(prog_array_map_fd, &key2, &prog_parse_rst_fd, 0);
+    if (err) {
+        fprintf(stderr, "ERROR: updating prog_array key 2 failed: %d\n", err);
+        goto cleanup;
+    }
+    err = bpf_map_update_elem(prog_array_map_fd, &key3, &prog_parse_icmp_fd, 0);
+    if (err) {
+        fprintf(stderr, "ERROR: updating prog_array key 3 failed: %d\n", err);
+        goto cleanup;
+    }
+    err = bpf_map_update_elem(prog_array_map_fd, &key4, &prog_parse_udp_fd, 0);
+    if (err) {
+        fprintf(stderr, "ERROR: updating prog_array key 4 failed: %d\n", err);
+        goto cleanup;
+    }
     
     // Attach the main XDP program to the interface.
-    err = bpf_xdp_attach(ifindex, prog_main_fd, attach_mode, NULL);
-    if (err < 0) {
+    attach_id = bpf_xdp_attach(ifindex, prog_main_fd, attach_mode, NULL);
+    if (attach_id < 0) {
         fprintf(stderr, "ERROR: attaching XDP program to %s (ifindex %d) failed: %d\n", ifname, ifindex, err);
         goto cleanup;
     }
@@ -473,7 +556,8 @@ cleanup:
     if (pb)
         perf_buffer__free(pb);
     // Detach the XDP program before exit.
-    bpf_xdp_detach(ifindex, 0, NULL);
+    if (attach_id > 0)
+        bpf_xdp_detach(ifindex, attach_mode, NULL);
     if (obj)
         bpf_object__close(obj);
     

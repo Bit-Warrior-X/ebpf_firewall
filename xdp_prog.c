@@ -4,6 +4,8 @@
 #include <linux/ip.h>
 #include <linux/in.h>
 #include <linux/tcp.h>
+#include <linux/icmp.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "common.h"
@@ -18,11 +20,14 @@ struct {
 /* Tail call map: keys will be used to jump to parse functions.
  * Key 0 -> xdp_parse_syn, 
    Key 1 -> xdp_parse_ack.
+   Key 2 -> xdp_parse_rst.
+   Key 3 -> xdp_parse_icmp.
+   Key 4 -> xdp_parse_udp.
  */
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 2);
+    __uint(max_entries, 10);
     __type(key, __u32);
     __type(value, __u32);
 } prog_array SEC(".maps");
@@ -84,50 +89,72 @@ int xdp_main(struct xdp_md *ctx) {
     if ((void*)(iph + 1) > data_end)
         return XDP_PASS;
     
-    // Only handle TCP packets.
-    if (iph->protocol != IPPROTO_TCP)
-        return XDP_PASS;
-    
-    // Calculate IP header length.
-    int ip_hdr_len = iph->ihl * 4;
-    struct tcphdr *tcph = (void *)iph + ip_hdr_len;
-    if ((void*)(tcph + 1) > data_end)
-        return XDP_PASS;
-    
-    // For test purpose, we use only 80 port in firewall
-    if (bpf_htons(tcph->dest) != 80)
-        return XDP_PASS;
+    // Handle TCP packets
+    if (iph->protocol == IPPROTO_TCP) {
+        // Calculate IP header length.
+        int ip_hdr_len = iph->ihl * 4;
+        struct tcphdr *tcph = (void *)iph + ip_hdr_len;
+        if ((void*)(tcph + 1) > data_end)
+            return XDP_PASS;
+        
+        // For test purpose, we use only 80 port in firewall
+        if (bpf_htons(tcph->dest) != 80)
+            return XDP_PASS;
 
-    // Check if the IP is already blocked.
-    __u32 src_ip = iph->saddr;
-    __u64 *blocked_exp = bpf_map_lookup_elem(&blocked_ips, &src_ip);
-    if (blocked_exp) {
-        if (now < *blocked_exp)
-            return XDP_DROP;
-        else {
-            bpf_printk("IP %pI4 removed from block list\n", &src_ip);
+        // Check if the IP is already blocked.
+        __u32 src_ip = iph->saddr;
+        __u64 *blocked_exp = bpf_map_lookup_elem(&blocked_ips, &src_ip);
+        if (blocked_exp) {
+            if (now < *blocked_exp)
+                return XDP_DROP;
+            else {
+                bpf_printk("IP %pI4 removed from block list\n", &src_ip);
 
-            struct event evt = {0};
-            evt.time = now;
-            evt.srcip = src_ip;
-            evt.reason = EVENT_IP_BLOCK_END;
-            // Send the event to user space on the current CPU.
-            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+                struct event evt = {0};
+                evt.time = now;
+                evt.srcip = src_ip;
+                evt.reason = EVENT_IP_BLOCK_END;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
 
-            bpf_map_delete_elem(&blocked_ips, &src_ip);
+                bpf_map_delete_elem(&blocked_ips, &src_ip);
+            }
+        }
+
+        // Check TCP flags:
+        // If SYN flag is set and ACK flag is not set, then it's a SYN packet.
+        if (tcph->syn && !tcph->ack) {
+            // Tail call to xdp_parse_syn (map key 0).
+            bpf_tail_call(ctx, &prog_array, 0);
+        }
+        // If ACK is set, excluding SYN, FIN, RST.
+        else if (tcph->ack && !tcph->syn && !tcph->fin && !tcph->rst) {
+            // Tail call to xdp_parse_ack (map key 1).
+            bpf_tail_call(ctx, &prog_array, 1);
+        }
+        // If RST is set.
+        else if (tcph->rst) {
+            // Tail call to xdp_parse_ack (map key 1).
+            bpf_tail_call(ctx, &prog_array, 2);
         }
     }
-
-    // Check TCP flags:
-    // If SYN flag is set and ACK flag is not set, then it's a SYN packet.
-    if (tcph->syn && !tcph->ack) {
-        // Tail call to xdp_parse_syn (map key 0).
-        bpf_tail_call(ctx, &prog_array, 0);
+    // Handle ICMP packets
+    else if (iph->protocol == IPPROTO_ICMP) {
+        // Calculate IP header length.
+        int ip_hdr_len = iph->ihl * 4;
+        struct icmphdr *icmph = (void *)iph + ip_hdr_len;
+        if ((void*)(icmph + 1) > data_end)
+            return XDP_PASS;
+        bpf_tail_call(ctx, &prog_array, 3);
     }
-    // If ACK is set, excluding SYN, FIN, RST.
-    else if (tcph->ack && !tcph->syn && !tcph->fin && !tcph->rst) {
-        // Tail call to xdp_parse_ack (map key 1).
-        bpf_tail_call(ctx, &prog_array, 1);
+    // Handle UDP packets
+    else if (iph->protocol == IPPROTO_UDP) {
+        // Calculate IP header length.
+        int ip_hdr_len = iph->ihl * 4;
+        struct udphdr *udphdr = (void *)iph + ip_hdr_len;
+        if ((void*)(udphdr + 1) > data_end)
+            return XDP_PASS;
+        bpf_tail_call(ctx, &prog_array, 4);
     }
     
     // If tail call fails or packet does not match above criteria,
@@ -558,7 +585,7 @@ int xdp_parse_ack(struct xdp_md *ctx) {
         global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
     }
 
-    struct flood_stats *counter = bpf_map_lookup_elem(&global_syn_counter, &key);
+    struct flood_stats *counter = bpf_map_lookup_elem(&global_ack_counter, &key);
     if (!counter)
         return XDP_PASS;
     
@@ -651,7 +678,7 @@ int xdp_parse_ack(struct xdp_md *ctx) {
         new_state.current_burst_count = 1;
         new_state.burst_count = 0;
         new_state.last_reset = now;
-        bpf_map_update_elem(&burst_syn_state, &src_ip, &new_state, BPF_ANY);
+        bpf_map_update_elem(&burst_ack_state, &src_ip, &new_state, BPF_ANY);
     }
     else {
         // Calculate total bursts (including current burst if it already reached threshold) 
@@ -740,4 +767,772 @@ int xdp_parse_ack(struct xdp_md *ctx) {
     return XDP_PASS;
 }
 
+
+/*---------------------------------------------- XDP RST Defense ------------------------------------------*/
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct rst_config);
+} rst_config_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} rst_attack_detect_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct flood_stats);
+} global_rst_counter SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);             // Source IP address.
+    __type(value, struct flood_stats);
+} rst_counter_fixed SEC(".maps");
+
+/* Map for per-source state: key: source IP (in network byte order), value: burst_state */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);
+    __type(value, struct burst_state);
+} burst_rst_state SEC(".maps");
+
+SEC("xdp")
+int xdp_parse_rst(struct xdp_md *ctx) {
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    __u64 now = bpf_ktime_get_ns();
+
+    // Parse Ethernet header.
+    struct ethhdr *eth = data;
+    if ((void*)(eth + 1) > data_end)
+        return XDP_PASS;
+    if (eth->h_proto != __constant_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    // Parse IP header.
+    struct iphdr *ip = data + sizeof(*eth);
+    if ((void*)(ip + 1) > data_end)
+        return XDP_PASS;
+    if (ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
+
+    // Parse TCP header.
+    struct tcphdr *tcp = (void *)ip + sizeof(*ip);
+    if ((void*)(tcp + 1) > data_end)
+        return XDP_PASS;
+    
+    __u32 key = 0;
+
+    struct global_config global_config_val = {0};
+    struct global_config * global_config_ptr = bpf_map_lookup_elem(&global_config_map, &key);
+
+    if (!global_config_ptr) {
+        global_config_val.black_ip_duration = BLOCK_DURATION_NS;
+    } else {
+        global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
+    }
+
+    struct flood_stats *counter = bpf_map_lookup_elem(&global_rst_counter, &key);
+    if (!counter)
+        return XDP_PASS;
+    
+    // Get the source IP address.
+    __u32 src_ip = ip->saddr;
+    __u32 dst_ip = ip->daddr;
+    
+    //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
+
+    // Get current threshold from map
+    key = 0;
+    struct rst_config config = {0};
+    struct rst_config * config_ptr = bpf_map_lookup_elem(&rst_config_map, &key);
+
+    if (!config_ptr) {
+        // Default value if map lookup fails
+        config.rst_threshold = RST_THRESHOLD;
+        config.burst_pkt_threshold = RST_BURST_PKT_THRESHOLD;
+        config.burst_count_threshold = RST_BURST_COUNT_THRESHOLD;
+        config.rst_fixed_threshold = RST_FIXED_THRESHOLD;
+        config.rst_fixed_check_duration = RST_FIXED_CHECK_DURATION_NS;
+        config.burst_gap_ns = RST_BURST_GAP_NS;
+    } else {
+        config.rst_threshold = config_ptr->rst_threshold;
+        config.burst_pkt_threshold = config_ptr->burst_pkt_threshold;
+        config.burst_count_threshold = config_ptr->burst_count_threshold;
+        config.rst_fixed_threshold = config_ptr->rst_fixed_threshold;
+        config.rst_fixed_check_duration = config_ptr->rst_fixed_check_duration;
+        config.burst_gap_ns = config_ptr->burst_gap_ns;
+    }
+
+    __u8 * rst_protect_mode = bpf_map_lookup_elem(&rst_attack_detect_map, &key);
+    if (!rst_protect_mode)
+        return XDP_PASS;
+
+    // If more than one second has passed, reset the counter.
+    if (now - counter->last_ts > ONE_SECOND_NS) {
+        if (counter->detected != *rst_protect_mode) {
+            if (counter->detected == 1) {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_TCP_RST_ATTACK_PROTECION_MODE_START;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            } else {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_TCP_RST_ATTACK_PROTECION_MODE_END;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            }
+        }
+
+        *rst_protect_mode = counter->detected;
+
+        counter->last_ts = now;
+        counter->count = 1;
+        counter->detected = 0;
+    } else {
+        if (counter->detected == 0) {
+            counter->count += 1;
+            if (counter->count >= config.rst_threshold) {
+                bpf_printk("DEBUG: Global RST pps reached %llu (threshold %d)\n", counter->count, config.rst_threshold);
+                if (*rst_protect_mode == 0 )
+                {
+                    struct event evt = {0};
+                    evt.time = now;
+                    evt.reason = EVENT_TCP_RST_ATTACK_PROTECION_MODE_START;
+                    // Send the event to user space on the current CPU.
+                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+                }
+                counter->detected = 1;
+                *rst_protect_mode = 1;
+            }
+        }
+    }
+
+    if (*rst_protect_mode == 0)
+        return XDP_PASS;
+
+    /*
+     1. Check rate limite detection
+    */
+    // Look up per-source state
+    struct burst_state *state = bpf_map_lookup_elem(&burst_rst_state, &src_ip);
+    if (!state) {
+        // No existing state: initialize one
+        struct burst_state new_state = {0};
+        new_state.last_pkt_time = now;
+        new_state.current_burst_count = 1;
+        new_state.burst_count = 0;
+        new_state.last_reset = now;
+        bpf_map_update_elem(&burst_rst_state, &src_ip, &new_state, BPF_ANY);
+    }
+    else {
+        // Calculate total bursts (including current burst if it already reached threshold) 
+        __u32 total_bursts = state->burst_count;
+        if (state->current_burst_count >= config.burst_pkt_threshold) {
+            total_bursts++;
+        }
+        
+        // If bursts per second threshold is reached, block source IP 
+        if (total_bursts >= config.burst_count_threshold) {
+            __u64 expire = now + global_config_val.black_ip_duration;
+            bpf_map_update_elem(&blocked_ips, &src_ip, &expire, BPF_ANY);
+            bpf_printk("Blocked source IP %pI4: bursts = %d\n", &src_ip, total_bursts);
+
+            struct event evt = {0};
+            evt.time = now;
+            evt.srcip = src_ip;
+            evt.reason = EVENT_TCP_RST_ATTACK_BURST_BLOCK;
+            // Send the event to user space on the current CPU.
+            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+
+            return XDP_DROP;
+        }
+
+        // Update state for each RST packet 
+        if (now - state->last_reset >= ONE_SECOND_NS) { 
+            // Reset state for the new second
+            state->last_reset = now;
+            state->current_burst_count = 1;
+            state->burst_count = 0;
+            state->last_pkt_time = now;
+        } else {
+            // Within same one-second window 
+            if (now - state->last_pkt_time > config.burst_gap_ns) {
+                // Gap too long: the previous burst ends. 
+                // Only count it if it met the threshold.
+                if (state->current_burst_count >= config.burst_pkt_threshold) {
+                    state->burst_count++;
+                }
+                // Start a new burst
+                state->current_burst_count = 1;
+            } else {
+                // No gap: keep accumulating in current burst
+                state->current_burst_count++;
+            }
+            state->last_pkt_time = now;
+        }
+        //bpf_printk("DEBUG: Burst current_burst_count %d (burst_count %d)\n", state->current_burst_count, state->burst_count);
+    }
+
+    // Process the fixed check counter.
+    struct flood_stats *fixed_stats = bpf_map_lookup_elem(&rst_counter_fixed, &src_ip);
+    if (fixed_stats) {
+        if (now - fixed_stats->last_ts > config.rst_fixed_check_duration) {
+            fixed_stats->count = 1;
+            fixed_stats->last_ts = now;
+        } else {
+            fixed_stats->count += 1;
+        }
+
+    } else {
+        struct flood_stats new_stats = {0};
+        new_stats.detected = 0;
+        new_stats.count = 1;
+        new_stats.last_ts = now;
+        bpf_map_update_elem(&rst_counter_fixed, &src_ip, &new_stats, BPF_ANY);
+    }
+
+    // Check if either threshold is exceeded.
+
+    if (fixed_stats && fixed_stats->count > config.rst_fixed_threshold) {
+        __u64 block_exp = now + global_config_val.black_ip_duration;
+        bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp, BPF_ANY);
+        bpf_printk("[RST] IP %pI4 blocked for 15-second threshold\n", &src_ip);
+
+        struct event evt = {0};
+        evt.time = now;
+        evt.srcip = src_ip;
+        evt.reason = EVENT_TCP_RST_ATTACK_FIXED_BLOCK;
+        // Send the event to user space on the current CPU.
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        
+        return XDP_DROP;
+    }
+    
+    return XDP_PASS;
+}
+
+
+
+/*---------------------------------------------- XDP ICMP Defense ------------------------------------------*/
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct icmp_config);
+} icmp_config_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} icmp_attack_detect_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct flood_stats);
+} global_icmp_counter SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);             // Source IP address.
+    __type(value, struct flood_stats);
+} icmp_counter_fixed SEC(".maps");
+
+/* Map for per-source state: key: source IP (in network byte order), value: burst_state */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);
+    __type(value, struct burst_state);
+} burst_icmp_state SEC(".maps");
+
+SEC("xdp")
+int xdp_parse_icmp(struct xdp_md *ctx) {
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    __u64 now = bpf_ktime_get_ns();
+
+    // Parse Ethernet header.
+    struct ethhdr *eth = data;
+    if ((void*)(eth + 1) > data_end)
+        return XDP_PASS;
+    if (eth->h_proto != __constant_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    // Parse IP header.
+    struct iphdr *ip = data + sizeof(*eth);
+    if ((void*)(ip + 1) > data_end)
+        return XDP_PASS;
+    if (ip->protocol != IPPROTO_ICMP)
+        return XDP_PASS;
+
+    // Parse TCP header.
+    struct icmphdr *icmp = (void *)ip + sizeof(*ip);
+    if ((void*)(icmp + 1) > data_end)
+        return XDP_PASS;
+    
+    __u32 key = 0;
+
+    struct global_config global_config_val = {0};
+    struct global_config * global_config_ptr = bpf_map_lookup_elem(&global_config_map, &key);
+
+    if (!global_config_ptr) {
+        global_config_val.black_ip_duration = BLOCK_DURATION_NS;
+    } else {
+        global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
+    }
+
+    struct flood_stats *counter = bpf_map_lookup_elem(&global_icmp_counter, &key);
+    if (!counter)
+        return XDP_PASS;
+    
+    // Get the source IP address.
+    __u32 src_ip = ip->saddr;
+    __u32 dst_ip = ip->daddr;
+    
+    //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
+
+    // Get current threshold from map
+    key = 0;
+    struct icmp_config config = {0};
+    struct icmp_config * config_ptr = bpf_map_lookup_elem(&icmp_config_map, &key);
+
+    if (!config_ptr) {
+        // Default value if map lookup fails
+        config.icmp_threshold = ICMP_THRESHOLD;
+        config.burst_pkt_threshold = ICMP_BURST_PKT_THRESHOLD;
+        config.burst_count_threshold = ICMP_BURST_COUNT_THRESHOLD;
+        config.icmp_fixed_threshold = ICMP_FIXED_THRESHOLD;
+        config.icmp_fixed_check_duration = ICMP_FIXED_CHECK_DURATION_NS;
+        config.burst_gap_ns = ICMP_BURST_GAP_NS;
+    } else {
+        config.icmp_threshold = config_ptr->icmp_threshold;
+        config.burst_pkt_threshold = config_ptr->burst_pkt_threshold;
+        config.burst_count_threshold = config_ptr->burst_count_threshold;
+        config.icmp_fixed_threshold = config_ptr->icmp_fixed_threshold;
+        config.icmp_fixed_check_duration = config_ptr->icmp_fixed_check_duration;
+        config.burst_gap_ns = config_ptr->burst_gap_ns;
+    }
+
+    __u8 * icmp_protect_mode = bpf_map_lookup_elem(&icmp_attack_detect_map, &key);
+    if (!icmp_protect_mode)
+        return XDP_PASS;
+
+    // If more than one second has passed, reset the counter.
+    if (now - counter->last_ts > ONE_SECOND_NS) {
+        if (counter->detected != *icmp_protect_mode) {
+            if (counter->detected == 1) {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_ICMP_ATTACK_PROTECION_MODE_START;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            } else {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_ICMP_ATTACK_PROTECION_MODE_END;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            }
+        }
+
+        *icmp_protect_mode = counter->detected;
+
+        counter->last_ts = now;
+        counter->count = 1;
+        counter->detected = 0;
+    } else {
+        if (counter->detected == 0) {
+            counter->count += 1;
+            if (counter->count >= config.icmp_threshold) {
+                bpf_printk("DEBUG: Global ICMP pps reached %llu (threshold %d)\n", counter->count, config.icmp_threshold);
+                if (*icmp_protect_mode == 0 )
+                {
+                    struct event evt = {0};
+                    evt.time = now;
+                    evt.reason = EVENT_ICMP_ATTACK_PROTECION_MODE_START;
+                    // Send the event to user space on the current CPU.
+                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+                }
+                counter->detected = 1;
+                *icmp_protect_mode = 1;
+            }
+        }
+    }
+
+    if (*icmp_protect_mode == 0)
+        return XDP_PASS;
+
+    /*
+     1. Check rate limite detection
+    */
+    // Look up per-source state
+    struct burst_state *state = bpf_map_lookup_elem(&burst_icmp_state, &src_ip);
+    if (!state) {
+        // No existing state: initialize one
+        struct burst_state new_state = {0};
+        new_state.last_pkt_time = now;
+        new_state.current_burst_count = 1;
+        new_state.burst_count = 0;
+        new_state.last_reset = now;
+        bpf_map_update_elem(&burst_icmp_state, &src_ip, &new_state, BPF_ANY);
+    }
+    else {
+        // Calculate total bursts (including current burst if it already reached threshold) 
+        __u32 total_bursts = state->burst_count;
+        if (state->current_burst_count >= config.burst_pkt_threshold) {
+            total_bursts++;
+        }
+        
+        // If bursts per second threshold is reached, block source IP 
+        if (total_bursts >= config.burst_count_threshold) {
+            __u64 expire = now + global_config_val.black_ip_duration;
+            bpf_map_update_elem(&blocked_ips, &src_ip, &expire, BPF_ANY);
+            bpf_printk("Blocked source IP %pI4: bursts = %d\n", &src_ip, total_bursts);
+
+            struct event evt = {0};
+            evt.time = now;
+            evt.srcip = src_ip;
+            evt.reason = EVENT_ICMP_ATTACK_BURST_BLOCK;
+            // Send the event to user space on the current CPU.
+            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+
+            return XDP_DROP;
+        }
+
+        // Update state for each ICMP packet 
+        if (now - state->last_reset >= ONE_SECOND_NS) { 
+            // Reset state for the new second
+            state->last_reset = now;
+            state->current_burst_count = 1;
+            state->burst_count = 0;
+            state->last_pkt_time = now;
+        } else {
+            // Within same one-second window 
+            if (now - state->last_pkt_time > config.burst_gap_ns) {
+                // Gap too long: the previous burst ends. 
+                // Only count it if it met the threshold.
+                if (state->current_burst_count >= config.burst_pkt_threshold) {
+                    state->burst_count++;
+                }
+                // Start a new burst
+                state->current_burst_count = 1;
+            } else {
+                // No gap: keep accumulating in current burst
+                state->current_burst_count++;
+            }
+            state->last_pkt_time = now;
+        }
+        //bpf_printk("DEBUG: Burst current_burst_count %d (burst_count %d)\n", state->current_burst_count, state->burst_count);
+    }
+
+    // Process the fixed check counter.
+    struct flood_stats *fixed_stats = bpf_map_lookup_elem(&icmp_counter_fixed, &src_ip);
+    if (fixed_stats) {
+        if (now - fixed_stats->last_ts > config.icmp_fixed_check_duration) {
+            fixed_stats->count = 1;
+            fixed_stats->last_ts = now;
+        } else {
+            fixed_stats->count += 1;
+        }
+
+    } else {
+        struct flood_stats new_stats = {0};
+        new_stats.detected = 0;
+        new_stats.count = 1;
+        new_stats.last_ts = now;
+        bpf_map_update_elem(&icmp_counter_fixed, &src_ip, &new_stats, BPF_ANY);
+    }
+
+    // Check if either threshold is exceeded.
+
+    if (fixed_stats && fixed_stats->count > config.icmp_fixed_threshold) {
+        __u64 block_exp = now + global_config_val.black_ip_duration;
+        bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp, BPF_ANY);
+        bpf_printk("[ICMP] IP %pI4 blocked for 15-second threshold\n", &src_ip);
+
+        struct event evt = {0};
+        evt.time = now;
+        evt.srcip = src_ip;
+        evt.reason = EVENT_ICMP_ATTACK_FIXED_BLOCK;
+        // Send the event to user space on the current CPU.
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        
+        return XDP_DROP;
+    }
+    
+    return XDP_PASS;
+}
+
+
+/*---------------------------------------------- XDP UDP Defense ------------------------------------------*/
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct udp_config);
+} udp_config_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} udp_attack_detect_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct flood_stats);
+} global_udp_counter SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);             // Source IP address.
+    __type(value, struct flood_stats);
+} udp_counter_fixed SEC(".maps");
+
+/* Map for per-source state: key: source IP (in network byte order), value: burst_state */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);
+    __type(value, struct burst_state);
+} burst_udp_state SEC(".maps");
+
+SEC("xdp")
+int xdp_parse_udp(struct xdp_md *ctx) {
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    __u64 now = bpf_ktime_get_ns();
+
+    // Parse Ethernet header.
+    struct ethhdr *eth = data;
+    if ((void*)(eth + 1) > data_end)
+        return XDP_PASS;
+    if (eth->h_proto != __constant_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    // Parse IP header.
+    struct iphdr *ip = data + sizeof(*eth);
+    if ((void*)(ip + 1) > data_end)
+        return XDP_PASS;
+    if (ip->protocol != IPPROTO_UDP)
+        return XDP_PASS;
+
+    // Parse TCP header.
+    struct udphdr *udp = (void *)ip + sizeof(*ip);
+    if ((void*)(udp + 1) > data_end)
+        return XDP_PASS;
+    
+    __u32 key = 0;
+
+    struct global_config global_config_val = {0};
+    struct global_config * global_config_ptr = bpf_map_lookup_elem(&global_config_map, &key);
+
+    if (!global_config_ptr) {
+        global_config_val.black_ip_duration = BLOCK_DURATION_NS;
+    } else {
+        global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
+    }
+
+    struct flood_stats *counter = bpf_map_lookup_elem(&global_udp_counter, &key);
+    if (!counter)
+        return XDP_PASS;
+    
+    // Get the source IP address.
+    __u32 src_ip = ip->saddr;
+    __u32 dst_ip = ip->daddr;
+    
+    //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
+
+    // Get current threshold from map
+    key = 0;
+    struct udp_config config = {0};
+    struct udp_config * config_ptr = bpf_map_lookup_elem(&udp_config_map, &key);
+
+    if (!config_ptr) {
+        // Default value if map lookup fails
+        config.udp_threshold = UDP_THRESHOLD;
+        config.burst_pkt_threshold = UDP_BURST_PKT_THRESHOLD;
+        config.burst_count_threshold = UDP_BURST_COUNT_THRESHOLD;
+        config.udp_fixed_threshold = UDP_FIXED_THRESHOLD;
+        config.udp_fixed_check_duration = UDP_FIXED_CHECK_DURATION_NS;
+        config.burst_gap_ns = UDP_BURST_GAP_NS;
+    } else {
+        config.udp_threshold = config_ptr->udp_threshold;
+        config.burst_pkt_threshold = config_ptr->burst_pkt_threshold;
+        config.burst_count_threshold = config_ptr->burst_count_threshold;
+        config.udp_fixed_threshold = config_ptr->udp_fixed_threshold;
+        config.udp_fixed_check_duration = config_ptr->udp_fixed_check_duration;
+        config.burst_gap_ns = config_ptr->burst_gap_ns;
+    }
+
+    __u8 * udp_protect_mode = bpf_map_lookup_elem(&udp_attack_detect_map, &key);
+    if (!udp_protect_mode)
+        return XDP_PASS;
+
+    // If more than one second has passed, reset the counter.
+    if (now - counter->last_ts > ONE_SECOND_NS) {
+        if (counter->detected != *udp_protect_mode) {
+            if (counter->detected == 1) {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_UDP_ATTACK_PROTECION_MODE_START;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            } else {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_UDP_ATTACK_PROTECION_MODE_END;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            }
+        }
+
+        *udp_protect_mode = counter->detected;
+
+        counter->last_ts = now;
+        counter->count = 1;
+        counter->detected = 0;
+    } else {
+        if (counter->detected == 0) {
+            counter->count += 1;
+            if (counter->count >= config.udp_threshold) {
+                bpf_printk("DEBUG: Global UDP pps reached %llu (threshold %d)\n", counter->count, config.udp_threshold);
+                if (*udp_protect_mode == 0 )
+                {
+                    struct event evt = {0};
+                    evt.time = now;
+                    evt.reason = EVENT_UDP_ATTACK_PROTECION_MODE_START;
+                    // Send the event to user space on the current CPU.
+                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+                }
+                counter->detected = 1;
+                *udp_protect_mode = 1;
+            }
+        }
+    }
+
+    if (*udp_protect_mode == 0)
+        return XDP_PASS;
+
+    /*
+     1. Check rate limite detection
+    */
+    // Look up per-source state
+    struct burst_state *state = bpf_map_lookup_elem(&burst_udp_state, &src_ip);
+    if (!state) {
+        // No existing state: initialize one
+        struct burst_state new_state = {0};
+        new_state.last_pkt_time = now;
+        new_state.current_burst_count = 1;
+        new_state.burst_count = 0;
+        new_state.last_reset = now;
+        bpf_map_update_elem(&burst_udp_state, &src_ip, &new_state, BPF_ANY);
+    }
+    else {
+        // Calculate total bursts (including current burst if it already reached threshold) 
+        __u32 total_bursts = state->burst_count;
+        if (state->current_burst_count >= config.burst_pkt_threshold) {
+            total_bursts++;
+        }
+        
+        // If bursts per second threshold is reached, block source IP 
+        if (total_bursts >= config.burst_count_threshold) {
+            __u64 expire = now + global_config_val.black_ip_duration;
+            bpf_map_update_elem(&blocked_ips, &src_ip, &expire, BPF_ANY);
+            bpf_printk("Blocked source IP %pI4: bursts = %d\n", &src_ip, total_bursts);
+
+            struct event evt = {0};
+            evt.time = now;
+            evt.srcip = src_ip;
+            evt.reason = EVENT_UDP_ATTACK_BURST_BLOCK;
+            // Send the event to user space on the current CPU.
+            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+
+            return XDP_DROP;
+        }
+
+        // Update state for each UDP packet 
+        if (now - state->last_reset >= ONE_SECOND_NS) { 
+            // Reset state for the new second
+            state->last_reset = now;
+            state->current_burst_count = 1;
+            state->burst_count = 0;
+            state->last_pkt_time = now;
+        } else {
+            // Within same one-second window 
+            if (now - state->last_pkt_time > config.burst_gap_ns) {
+                // Gap too long: the previous burst ends. 
+                // Only count it if it met the threshold.
+                if (state->current_burst_count >= config.burst_pkt_threshold) {
+                    state->burst_count++;
+                }
+                // Start a new burst
+                state->current_burst_count = 1;
+            } else {
+                // No gap: keep accumulating in current burst
+                state->current_burst_count++;
+            }
+            state->last_pkt_time = now;
+        }
+        //bpf_printk("DEBUG: Burst current_burst_count %d (burst_count %d)\n", state->current_burst_count, state->burst_count);
+    }
+
+    // Process the fixed check counter.
+    struct flood_stats *fixed_stats = bpf_map_lookup_elem(&udp_counter_fixed, &src_ip);
+    if (fixed_stats) {
+        if (now - fixed_stats->last_ts > config.udp_fixed_check_duration) {
+            fixed_stats->count = 1;
+            fixed_stats->last_ts = now;
+        } else {
+            fixed_stats->count += 1;
+        }
+
+    } else {
+        struct flood_stats new_stats = {0};
+        new_stats.detected = 0;
+        new_stats.count = 1;
+        new_stats.last_ts = now;
+        bpf_map_update_elem(&udp_counter_fixed, &src_ip, &new_stats, BPF_ANY);
+    }
+
+    // Check if either threshold is exceeded.
+
+    if (fixed_stats && fixed_stats->count > config.udp_fixed_threshold) {
+        __u64 block_exp = now + global_config_val.black_ip_duration;
+        bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp, BPF_ANY);
+        bpf_printk("[UDP] IP %pI4 blocked for 15-second threshold\n", &src_ip);
+
+        struct event evt = {0};
+        evt.time = now;
+        evt.srcip = src_ip;
+        evt.reason = EVENT_UDP_ATTACK_FIXED_BLOCK;
+        // Send the event to user space on the current CPU.
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        
+        return XDP_DROP;
+    }
+    
+    return XDP_PASS;
+}
 char _license[] SEC("license") = "GPL";

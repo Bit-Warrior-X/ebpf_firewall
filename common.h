@@ -19,12 +19,33 @@
 #define SYN_CHALLENGE_TIMEOUT_NS    (2ULL * ONE_SECOND_NS)    // Timeout for challenge state
 #define SYN_BURST_GAP_NS            ONE_SECOND_NS / SYN_BURST_COUNT_THRESHOLD    /* 100 ms gap ends a burst */
 
-#define ACK_THRESHOLD               200000                    // 200K SYN packets per second
+#define ACK_THRESHOLD               200000                    // 200K ACK packets per second
 #define ACK_BURST_COUNT_THRESHOLD   100                       /* 10 bursts per second triggers block */
-#define ACK_BURST_PKT_THRESHOLD     200                       /* Each burst must have >=20 SYN packets */
-#define ACK_FIXED_THRESHOLD         20000                     // Maximum SYN packets allowed in a 15-second window.
+#define ACK_BURST_PKT_THRESHOLD     200                       /* Each burst must have >=20 ACK packets */
+#define ACK_FIXED_THRESHOLD         20000                     // Maximum ACK packets allowed in a 15-second window.
 #define ACK_FIXED_CHECK_DURATION_NS (15ULL * ONE_SECOND_NS)   // 15 seconds for fixed duration check
 #define ACK_BURST_GAP_NS            ONE_SECOND_NS / ACK_BURST_PKT_THRESHOLD     
+
+#define RST_THRESHOLD               200000                    // 200K RST packets per second
+#define RST_BURST_COUNT_THRESHOLD   10                        /* 10 bursts per second triggers block */
+#define RST_BURST_PKT_THRESHOLD     20                        /* Each burst must have >=20 RST packets */
+#define RST_FIXED_THRESHOLD         20000                     // Maximum RST packets allowed in a 15-second window.
+#define RST_FIXED_CHECK_DURATION_NS (15ULL * ONE_SECOND_NS)   // 15 seconds for fixed duration check
+#define RST_BURST_GAP_NS            ONE_SECOND_NS / RST_BURST_PKT_THRESHOLD 
+
+#define ICMP_THRESHOLD               200000                    // 200K ICMP packets per second
+#define ICMP_BURST_COUNT_THRESHOLD   10                        /* 10 bursts per second triggers block */
+#define ICMP_BURST_PKT_THRESHOLD     20                        /* Each burst must have >=20 ICMP packets */
+#define ICMP_FIXED_THRESHOLD         20000                     // Maximum ICMP packets allowed in a 15-second window.
+#define ICMP_FIXED_CHECK_DURATION_NS (15ULL * ONE_SECOND_NS)   // 15 seconds for fixed duration check
+#define ICMP_BURST_GAP_NS            ONE_SECOND_NS / ICMP_BURST_PKT_THRESHOLD
+
+#define UDP_THRESHOLD               200000                     // 200K ICMP packets per second
+#define UDP_BURST_COUNT_THRESHOLD   10                         /* 10 bursts per second triggers block */
+#define UDP_BURST_PKT_THRESHOLD     20                         /* Each burst must have >=20 UDP packets */
+#define UDP_FIXED_THRESHOLD         20000                      // Maximum UDP packets allowed in a 15-second window.
+#define UDP_FIXED_CHECK_DURATION_NS (15ULL * ONE_SECOND_NS)    // 15 seconds for fixed duration check
+#define UDP_BURST_GAP_NS            ONE_SECOND_NS / UDP_BURST_PKT_THRESHOLD
 
 #define EVENT_IP_BLOCK_END                         0
 #define EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START  10
@@ -36,6 +57,21 @@
 #define EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END    21
 #define EVENT_TCP_ACK_ATTACK_BURST_BLOCK           22
 #define EVENT_TCP_ACK_ATTACK_FIXED_BLOCK           23
+
+#define EVENT_TCP_RST_ATTACK_PROTECION_MODE_START  30
+#define EVENT_TCP_RST_ATTACK_PROTECION_MODE_END    31
+#define EVENT_TCP_RST_ATTACK_BURST_BLOCK           32
+#define EVENT_TCP_RST_ATTACK_FIXED_BLOCK           33
+
+#define EVENT_ICMP_ATTACK_PROTECION_MODE_START     40
+#define EVENT_ICMP_ATTACK_PROTECION_MODE_END       41
+#define EVENT_ICMP_ATTACK_BURST_BLOCK              42
+#define EVENT_ICMP_ATTACK_FIXED_BLOCK              43
+
+#define EVENT_UDP_ATTACK_PROTECION_MODE_START      50
+#define EVENT_UDP_ATTACK_PROTECION_MODE_END        51
+#define EVENT_UDP_ATTACK_BURST_BLOCK               52
+#define EVENT_UDP_ATTACK_FIXED_BLOCK               53
 
 struct global_config {
     __u64 black_ip_duration;     // Blacklist duration in seconds
@@ -79,6 +115,33 @@ struct ack_config {
     __u64 burst_count_threshold;
     __u32 ack_fixed_threshold;
     __u64 ack_fixed_check_duration;
+};
+
+struct rst_config {
+    __u32 rst_threshold;       
+    __u64 burst_gap_ns; 
+    __u32 burst_pkt_threshold;
+    __u64 burst_count_threshold;
+    __u32 rst_fixed_threshold;
+    __u64 rst_fixed_check_duration;
+};
+
+struct icmp_config {
+    __u32 icmp_threshold;       
+    __u64 burst_gap_ns; 
+    __u32 burst_pkt_threshold;
+    __u64 burst_count_threshold;
+    __u32 icmp_fixed_threshold;
+    __u64 icmp_fixed_check_duration;
+};
+
+struct udp_config {
+    __u32 udp_threshold;       
+    __u64 burst_gap_ns; 
+    __u32 burst_pkt_threshold;
+    __u64 burst_count_threshold;
+    __u32 udp_fixed_threshold;
+    __u64 udp_fixed_check_duration;
 };
 
 // New structure and map for the SYN challenge state.

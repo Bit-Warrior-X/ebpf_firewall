@@ -6,47 +6,26 @@
 #include <linux/tcp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include "common.h"
 
-
-// Define time constants (in nanoseconds)
-#define ONE_SECOND_NS      1000000000ULL
-#define SIXTEEN_SECONDS_NS (16ULL * 1000000000ULL)
-#define BLOCK_DURATION_NS  (3600ULL * 1000000000ULL)  // 1 hour
-#define CHALLENGE_TIMEOUT_NS (2ULL * ONE_SECOND_NS)    // Timeout for challenge state
-
-// Thresholds: Adjust these as required.
-#define PPS_THRESHOLD    10000  // Maximum SYN packets per second allowed.
-#define FIXED_THRESHOLD  50000  // Maximum SYN packets allowed in a 16-second window.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct global_config);
+} global_config_map SEC(".maps");
 
 /* Tail call map: keys will be used to jump to parse functions.
- * Key 0 -> xdp_parse_syn, Key 1 -> xdp_parse_ack.
+ * Key 0 -> xdp_parse_syn, 
+   Key 1 -> xdp_parse_ack.
  */
+
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
     __uint(max_entries, 2);
     __type(key, __u32);
     __type(value, __u32);
 } prog_array SEC(".maps");
-
-// Existing counters for flood detection.
-struct syn_stats {
-    __u64 count;
-    __u64 last_ts;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65535);
-    __type(key, __u32);             // Source IP address.
-    __type(value, struct syn_stats);
-} syn_counter_1s SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65535);
-    __type(key, __u32);             // Source IP address.
-    __type(value, struct syn_stats);
-} syn_counter_16s SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -55,34 +34,14 @@ struct {
     __type(value, __u64);           // Block expiration time (ns)
 } blocked_ips SEC(".maps");
 
-// New structure and map for the SYN challenge state.
-struct challenge_state {
-    __u8 stage;       // 1: first SYN seen; 2: challenge sent (waiting for client response)
-    __u64 ts;         // Timestamp when state was updated
-    __u32 seq;        // Seq Number of syn
-    __u32 wrong_seq;  // An arbitrary “wrong” sequence number to send in our challenge SYN+ACK.
-};
-
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 1000000);
-    __type(key, __u32);             // Source IP address.
-    __type(value, struct challenge_state);
-} syn_challenge SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(max_entries, 32);
+    __type(key, __u32);      // CPU index
+    __type(value, int);      // Must be int (FD)
+} events SEC(".maps");
 
-/* LRU hash map to record source IP addresses for SYN packets.
- * The key is the source IP (in network byte order)
- * The value is a counter (number of SYN packets seen).
- */
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 100000);
-    __type(key, __u32);   // Source IP address.
-    __type(value, __u8);  // Temp value.
-} syn_allowed_ips SEC(".maps");
-
-
-
+/*-------------------------------------------- Static Functions ------------------------------------*/
 static __always_inline __u16
 csum_fold_helper(__u64 csum)
 {
@@ -102,7 +61,9 @@ iph_csum(struct iphdr *iph)
     unsigned long long csum = bpf_csum_diff(0, 0, (unsigned int *)iph, sizeof(struct iphdr), 0);
     return csum_fold_helper(csum);
 }
+/*--------------------------------------------------------------------------------------------------*/
 
+/*---------------------------------------------- XDP Main ------------------------------------------*/
 SEC("xdp")
 int xdp_main(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -145,6 +106,14 @@ int xdp_main(struct xdp_md *ctx) {
             return XDP_DROP;
         else {
             bpf_printk("IP %pI4 removed from block list\n", &src_ip);
+
+            struct event evt = {0};
+            evt.time = now;
+            evt.srcip = src_ip;
+            evt.reason = EVENT_IP_BLOCK_END;
+            // Send the event to user space on the current CPU.
+            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+
             bpf_map_delete_elem(&blocked_ips, &src_ip);
         }
     }
@@ -155,8 +124,8 @@ int xdp_main(struct xdp_md *ctx) {
         // Tail call to xdp_parse_syn (map key 0).
         bpf_tail_call(ctx, &prog_array, 0);
     }
-    // If ACK or RST flag is set, then it is treated as an ACK packet.
-    else if (tcph->ack || tcph->rst) {
+    // If ACK is set, excluding SYN, FIN, RST.
+    else if (tcph->ack && !tcph->syn && !tcph->fin && !tcph->rst) {
         // Tail call to xdp_parse_ack (map key 1).
         bpf_tail_call(ctx, &prog_array, 1);
     }
@@ -165,6 +134,62 @@ int xdp_main(struct xdp_md *ctx) {
     // then pass the packet.
     return XDP_PASS;
 }
+
+/*---------------------------------------------- XDP SYN Defense ------------------------------------------*/
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct syn_config);
+} syn_config_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} syn_attack_detect_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct flood_stats);
+} global_syn_counter SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);             // Source IP address.
+    __type(value, struct flood_stats);
+} syn_counter_fixed SEC(".maps");
+
+/* Map for per-source state: key: source IP (in network byte order), value: burst_state */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);
+    __type(value, struct burst_state);
+} burst_syn_state SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u32);             // Source IP address.
+    __type(value, struct challenge_state);
+} syn_challenge SEC(".maps");
+
+/* LRU hash map to record source IP addresses for SYN packets.
+ * The key is the source IP (in network byte order)
+ * The value is a counter (number of SYN packets seen).
+ */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 100000);
+    __type(key, __u32);   // Source IP address.
+    __type(value, __u8);  // Temp value.
+} syn_allowed_ips SEC(".maps");
 
 SEC("xdp")
 int xdp_parse_syn(struct xdp_md *ctx) {
@@ -190,131 +215,269 @@ int xdp_parse_syn(struct xdp_md *ctx) {
     struct tcphdr *tcp = (void *)ip + sizeof(*ip);
     if ((void*)(tcp + 1) > data_end)
         return XDP_PASS;
+    
+    __u32 key = 0;
 
+    struct global_config global_config_val = {0};
+    struct global_config * global_config_ptr = bpf_map_lookup_elem(&global_config_map, &key);
+
+    if (!global_config_ptr) {
+        global_config_val.black_ip_duration = BLOCK_DURATION_NS;
+    } else {
+        global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
+    }
+
+    struct flood_stats *counter = bpf_map_lookup_elem(&global_syn_counter, &key);
+    if (!counter)
+        return XDP_PASS;
+    
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
     __u32 dst_ip = ip->daddr;
     
-    // Process only TCP SYN packets (SYN set, ACK not set).
-    if (tcp->syn && !tcp->ack) {
-        //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
-        // Check challenge state for this source IP.
-        struct challenge_state *cstate = bpf_map_lookup_elem(&syn_challenge, &src_ip);
-        if (cstate) {
-            // If the state is too old, remove it.
-            if (now - cstate->ts > CHALLENGE_TIMEOUT_NS) {
-                // We have to determine if it is retransmission TCP SYN
-                if (cstate->seq != tcp->seq) { 
-                    //bpf_printk("  IP %pI4 is too old(%llu) and the syn is different\n", &src_ip, (now - cstate->ts) / 1000000000);        
-                    bpf_map_delete_elem(&syn_challenge, &src_ip);
-                    cstate = NULL;
+    //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
+
+    // Get current threshold from map
+    key = 0;
+    struct syn_config config = {0};
+    struct syn_config * config_ptr = bpf_map_lookup_elem(&syn_config_map, &key);
+
+    if (!config_ptr) {
+        // Default value if map lookup fails
+        config.syn_threshold = SYN_THRESHOLD;
+        config.burst_pkt_threshold = SYN_BURST_PKT_THRESHOLD;
+        config.burst_count_threshold = SYN_BURST_COUNT_THRESHOLD;
+        config.challenge_timeout = SYN_CHALLENGE_TIMEOUT_NS;
+        config.syn_fixed_threshold = SYN_FIXED_THRESHOLD;
+        config.syn_fixed_check_duration = SYN_FIXED_CHECK_DURATION_NS;
+        config.burst_gap_ns = SYN_BURST_GAP_NS;
+    } else {
+        config.syn_threshold = config_ptr->syn_threshold;
+        config.burst_pkt_threshold = config_ptr->burst_pkt_threshold;
+        config.burst_count_threshold = config_ptr->burst_count_threshold;
+        config.challenge_timeout = config_ptr->challenge_timeout;
+        config.syn_fixed_threshold = config_ptr->syn_fixed_threshold;
+        config.burst_gap_ns = config_ptr->burst_gap_ns;
+        config.syn_fixed_check_duration = config_ptr->syn_fixed_check_duration;
+    }
+
+    __u8 * syn_protect_mode = bpf_map_lookup_elem(&syn_attack_detect_map, &key);
+    if (!syn_protect_mode)
+        return XDP_PASS;
+
+    // If more than one second has passed, reset the counter.
+    if (now - counter->last_ts > ONE_SECOND_NS) {
+        if (counter->detected != *syn_protect_mode) {
+            if (counter->detected == 1) {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            } else {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            }
+        }
+
+        *syn_protect_mode = counter->detected;
+
+        counter->last_ts = now;
+        counter->count = 1;
+        counter->detected = 0;
+    } else {
+        if (counter->detected == 0) {
+            counter->count += 1;
+            if (counter->count >= config.syn_threshold) {
+                bpf_printk("DEBUG: Global SYN pps reached %llu (threshold %d)\n", counter->count, config.syn_threshold);
+                if (*syn_protect_mode == 0 )
+                {
+                    struct event evt = {0};
+                    evt.time = now;
+                    evt.reason = EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START;
+                    // Send the event to user space on the current CPU.
+                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
                 }
+                counter->detected = 1;
+                *syn_protect_mode = 1;
             }
-        }
-
-        if (cstate == NULL) {
-            // First SYN from this IP:
-            struct challenge_state new_state = {
-                .stage = 1,
-                .ts = now,
-                .seq = tcp->seq,
-                .wrong_seq = 0xdeadbeef  // Arbitrary wrong sequence number.
-            };
-            int result = bpf_map_update_elem(&syn_challenge, &src_ip, &new_state, BPF_ANY);
-            // Drop the packet so that only retransmissions trigger further processing.
-            //bpf_printk("  cstate is NULL and add it into syn challenge with %d\n", result);
-            return XDP_DROP;
-
-        } else if (cstate->stage == 1) {
-            // Swap MAC addresses
-            unsigned char tmp_mac[ETH_ALEN];
-            __builtin_memcpy(tmp_mac, eth->h_source, ETH_ALEN);
-            __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
-            __builtin_memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
-
-            // Swap IP addresses
-            __be32 tmp_ip = ip->saddr;
-            ip->saddr = ip->daddr;
-            ip->daddr = tmp_ip;
-
-            // Swap TCP ports
-            __be16 tmp_port = tcp->source;
-            tcp->source = tcp->dest;
-            tcp->dest = tmp_port;
-
-            // Set SYN-ACK flags
-            tcp->ack = 1;
-            tcp->ack_seq = bpf_htonl(bpf_ntohl(tcp->seq) + 1);
-            tcp->seq = bpf_htonl(0x1234); // Initial sequence number for the response
-
-            ip->check = iph_csum(ip);
-
-            // Update challenge state.
-            cstate->stage = 2;
-            cstate->ts = now;
-
-            //bpf_printk("  Sent challenge SYN+ACK to %pI4 (ack_seq is %x, tcp->seq is %x, window is %x)\n",
-            //        &src_ip, tcp->ack_seq, tcp->seq, tcp->window);
-            return XDP_TX;
-        }
-        else if (cstate->stage == 2) {
-            // This is the client's follow-up SYN in response to our challenge.
-            // Remove the challenge state and allow the packet to be processed normally.
-            bpf_map_delete_elem(&syn_challenge, &src_ip);
-            //bpf_printk("  Challenge passed for %pI4\n", &src_ip);
-            // (Fall through to the SYN flood detection logic.)
         }
     }
 
-    // ----- Existing SYN flood detection counters -----
-    if (tcp->syn && !tcp->ack) {
-        // Process the 1-second counter.
-        struct syn_stats *stats1 = bpf_map_lookup_elem(&syn_counter_1s, &src_ip);
-        if (stats1) {
-            if (now - stats1->last_ts > ONE_SECOND_NS) {
-                stats1->count = 1;
-                stats1->last_ts = now;
-            } else {
-                stats1->count += 1;
-            }
-        } else {
-            struct syn_stats new_stats = { .count = 1, .last_ts = now };
-            bpf_map_update_elem(&syn_counter_1s, &src_ip, &new_stats, BPF_ANY);
-        }
+    if (*syn_protect_mode == 0)
+        return XDP_PASS;
 
-        // Process the 16-second counter.
-        struct syn_stats *stats16 = bpf_map_lookup_elem(&syn_counter_16s, &src_ip);
-        if (stats16) {
-            if (now - stats16->last_ts > SIXTEEN_SECONDS_NS) {
-                stats16->count = 1;
-                stats16->last_ts = now;
-            } else {
-                stats16->count += 1;
-            }
-        } else {
-            struct syn_stats new_stats = { .count = 1, .last_ts = now };
-            bpf_map_update_elem(&syn_counter_16s, &src_ip, &new_stats, BPF_ANY);
-        }
-
-        // Check if either threshold is exceeded.
-        if (stats1 && stats1->count > PPS_THRESHOLD) {
-            __u64 block_exp = now + BLOCK_DURATION_NS;
-            bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp, BPF_ANY);
-            bpf_printk("[SYN] IP %pI4 blocked for per-second threshold\n", &src_ip);
-            return XDP_DROP;
-        }
-        if (stats16 && stats16->count > FIXED_THRESHOLD) {
-            __u64 block_exp = now + BLOCK_DURATION_NS;
-            bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp, BPF_ANY);
-            bpf_printk("[SYN] IP %pI4 blocked for 16-second threshold\n", &src_ip);
-            return XDP_DROP;
-        }
-
-        bpf_printk("[SYN] packet for %pI4:%d -----> %pI4:%d is filtered\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
-
-        __u8 temp_value = 1;
-        bpf_map_update_elem(&syn_allowed_ips, &src_ip, &temp_value, BPF_ANY);
+    /*
+     1. Check rate limite detection
+    */
+    // Look up per-source state
+    struct burst_state *state = bpf_map_lookup_elem(&burst_syn_state, &src_ip);
+    if (!state) {
+        // No existing state: initialize one
+        struct burst_state new_state = {0};
+        new_state.last_pkt_time = now;
+        new_state.current_burst_count = 1;
+        new_state.burst_count = 0;
+        new_state.last_reset = now;
+        bpf_map_update_elem(&burst_syn_state, &src_ip, &new_state, BPF_ANY);
     }
+    else {
+        // Calculate total bursts (including current burst if it already reached threshold) 
+        __u32 total_bursts = state->burst_count;
+        if (state->current_burst_count >= config.burst_pkt_threshold) {
+            total_bursts++;
+        }
+        
+        // If bursts per second threshold is reached, block source IP 
+        if (total_bursts >= config.burst_count_threshold) {
+            __u64 expire = now + global_config_val.black_ip_duration;
+            bpf_map_update_elem(&blocked_ips, &src_ip, &expire, BPF_ANY);
+            bpf_printk("Blocked source IP %pI4: bursts = %d\n", &src_ip, total_bursts);
+
+            struct event evt = {0};
+            evt.time = now;
+            evt.srcip = src_ip;
+            evt.reason = EVENT_TCP_SYN_ATTACK_BURST_BLOCK;
+            // Send the event to user space on the current CPU.
+            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+
+            return XDP_DROP;
+        }
+
+        // Update state for each SYN packet 
+        if (now - state->last_reset >= ONE_SECOND_NS) { 
+            // Reset state for the new second
+            state->last_reset = now;
+            state->current_burst_count = 1;
+            state->burst_count = 0;
+            state->last_pkt_time = now;
+        } else {
+            // Within same one-second window 
+            if (now - state->last_pkt_time > config.burst_gap_ns) {
+                // Gap too long: the previous burst ends. 
+                // Only count it if it met the threshold.
+                if (state->current_burst_count >= config.burst_pkt_threshold) {
+                    state->burst_count++;
+                }
+                // Start a new burst
+                state->current_burst_count = 1;
+            } else {
+                // No gap: keep accumulating in current burst
+                state->current_burst_count++;
+            }
+            state->last_pkt_time = now;
+        }
+        //bpf_printk("DEBUG: Burst current_burst_count %d (burst_count %d)\n", state->current_burst_count, state->burst_count);
+    }
+
+
+    /*
+     2. Check syn challenge validation
+    */
+
+    // Check challenge state for this source IP.
+    struct challenge_state *cstate = bpf_map_lookup_elem(&syn_challenge, &src_ip);
+    if (cstate) {
+        // If the state is too old, remove it.
+        if (now - cstate->ts > config.challenge_timeout) {
+            // We have to determine if it is retransmission TCP SYN
+            if (cstate->seq != tcp->seq) {     
+                bpf_map_delete_elem(&syn_challenge, &src_ip);
+                cstate = NULL;
+            }
+        }
+    }
+
+    if (cstate == NULL) {
+        // First SYN from this IP:
+        struct challenge_state new_state = {0};
+        new_state.stage = 1;
+        new_state.ts = now;
+        new_state.seq = tcp->seq;
+        new_state.wrong_seq = 0xdeadbeef;  // Arbitrary wrong sequence number.
+        bpf_map_update_elem(&syn_challenge, &src_ip, &new_state, BPF_ANY);
+        return XDP_DROP;
+
+    } else if (cstate->stage == 1) {
+        // Swap MAC addresses
+        unsigned char tmp_mac[ETH_ALEN];
+        __builtin_memcpy(tmp_mac, eth->h_source, ETH_ALEN);
+        __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+        __builtin_memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
+
+        // Swap IP addresses
+        __be32 tmp_ip = ip->saddr;
+        ip->saddr = ip->daddr;
+        ip->daddr = tmp_ip;
+
+        // Swap TCP ports
+        __be16 tmp_port = tcp->source;
+        tcp->source = tcp->dest;
+        tcp->dest = tmp_port;
+
+        // Set SYN-ACK flags
+        tcp->ack = 1;
+        tcp->ack_seq = bpf_htonl(bpf_ntohl(tcp->seq) + 1);
+        tcp->seq = bpf_htonl(0x1234); // Initial sequence number for the response
+
+        ip->check = iph_csum(ip);
+
+        // Update challenge state.
+        cstate->stage = 2;
+        cstate->ts = now;
+
+        //bpf_printk("  Sent challenge SYN+ACK to %pI4 (ack_seq is %x, tcp->seq is %x, window is %x)\n",
+        //        &src_ip, tcp->ack_seq, tcp->seq, tcp->window);
+        return XDP_TX;
+    }
+    else if (cstate->stage == 2) {
+        // This is the client's follow-up SYN in response to our challenge.
+        // Remove the challenge state and allow the packet to be processed normally.
+        bpf_map_delete_elem(&syn_challenge, &src_ip);
+    }
+
+    // Process the fixed check counter.
+    struct flood_stats *fixed_stats = bpf_map_lookup_elem(&syn_counter_fixed, &src_ip);
+    if (fixed_stats) {
+        if (now - fixed_stats->last_ts > config.syn_fixed_check_duration) {
+            fixed_stats->count = 1;
+            fixed_stats->last_ts = now;
+        } else {
+            fixed_stats->count += 1;
+        }
+
+    } else {
+        struct flood_stats new_stats = {0};
+        new_stats.detected = 0;
+        new_stats.count = 1;
+        new_stats.last_ts = now;
+        bpf_map_update_elem(&syn_counter_fixed, &src_ip, &new_stats, BPF_ANY);
+    }
+
+    // Check if either threshold is exceeded.
+
+    if (fixed_stats && fixed_stats->count > config.syn_fixed_threshold) {
+        __u64 block_exp = now + global_config_val.black_ip_duration;
+        bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp, BPF_ANY);
+        bpf_printk("[SYN] IP %pI4 blocked for 15-second threshold\n", &src_ip);
+
+        struct event evt = {0};
+        evt.time = now;
+        evt.srcip = src_ip;
+        evt.reason = EVENT_TCP_SYN_ATTACK_FIXED_BLOCK;
+        // Send the event to user space on the current CPU.
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        
+        return XDP_DROP;
+    }
+
+    //bpf_printk("[SYN] packet for %pI4:%d -----> %pI4:%d is filtered\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
+ 
+    //__u8 temp_value = 1;
+    //bpf_map_update_elem(&syn_allowed_ips, &src_ip, &temp_value, BPF_ANY);
     // --------------------------------------------------
 
     // Allow other packets (or non-SYN packets) to pass.
@@ -322,107 +485,258 @@ int xdp_parse_syn(struct xdp_md *ctx) {
 }
 
 
-// Thresholds: adjust these values as needed.
-#define ACK_PPS_THRESHOLD 20000    // Maximum ACK/RST packets per second allowed.
-#define ACK_FIXED_THRESHOLD 100000 // Maximum ACK/RST packets allowed in a 16-second window.
+/*---------------------------------------------- XDP ACK Defense ------------------------------------------*/
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct ack_config);
+} ack_config_map SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} ack_attack_detect_map SEC(".maps");
 
-// Counters for ACK/RST flood detection.
-struct ack_stats {
-    __u64 count;
-    __u64 last_ts;
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct flood_stats);
+} global_ack_counter SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 100000);
-    __type(key, __u32);    // Source IP address.
-    __type(value, struct ack_stats);
-} ack_counter_1s SEC(".maps");
+    __uint(max_entries, 65535);
+    __type(key, __u32);             // Source IP address.
+    __type(value, struct flood_stats);
+} ack_counter_fixed SEC(".maps");
 
+/* Map for per-source state: key: source IP (in network byte order), value: burst_state */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 100000);
-    __type(key, __u32);    // Source IP address.
-    __type(value, struct ack_stats);
-} ack_counter_16s SEC(".maps");
+    __uint(max_entries, 65535);
+    __type(key, __u32);
+    __type(value, struct burst_state);
+} burst_ack_state SEC(".maps");
 
 SEC("xdp")
-int xdp_parse_ack_rst(struct xdp_md *ctx) {
-    void *data     = (void *)(long)ctx->data;
+int xdp_parse_ack(struct xdp_md *ctx) {
+    void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
     __u64 now = bpf_ktime_get_ns();
-    
+
+    // Parse Ethernet header.
     struct ethhdr *eth = data;
     if ((void*)(eth + 1) > data_end)
-        return XDP_DROP;
-    
+        return XDP_PASS;
     if (eth->h_proto != __constant_htons(ETH_P_IP))
-        return XDP_DROP;
-    
-    struct iphdr *iph = data + sizeof(*eth);
-    if ((void*)(iph + 1) > data_end)
-        return XDP_DROP;
-    
-    struct tcphdr *tcp = (void *)iph + sizeof(*iph);
-    if ((void*)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    __u32 src_ip = iph->saddr;
-    __u32 dst_ip = iph->daddr;
+    // Parse IP header.
+    struct iphdr *ip = data + sizeof(*eth);
+    if ((void*)(ip + 1) > data_end)
+        return XDP_PASS;
+    if (ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
+
+    // Parse TCP header.
+    struct tcphdr *tcp = (void *)ip + sizeof(*ip);
+    if ((void*)(tcp + 1) > data_end)
+        return XDP_PASS;
     
-    // Process only packets with ACK or RST flag set.
-    if (tcp->ack || tcp->rst) {
-        __u8 *temp_value = bpf_map_lookup_elem(&syn_allowed_ips, &src_ip);
-        if (temp_value == NULL) {  // Not added in syn challenge
-            return XDP_DROP;
-        }
+    __u32 key = 0;
 
-        // Update 1-second counter.
-        struct ack_stats *stats1 = bpf_map_lookup_elem(&ack_counter_1s, &src_ip);
-        if (stats1) {
-            if (now - stats1->last_ts > ONE_SECOND_NS) {
-                stats1->count = 1;
-                stats1->last_ts = now;
+    struct global_config global_config_val = {0};
+    struct global_config * global_config_ptr = bpf_map_lookup_elem(&global_config_map, &key);
+
+    if (!global_config_ptr) {
+        global_config_val.black_ip_duration = BLOCK_DURATION_NS;
+    } else {
+        global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
+    }
+
+    struct flood_stats *counter = bpf_map_lookup_elem(&global_syn_counter, &key);
+    if (!counter)
+        return XDP_PASS;
+    
+    // Get the source IP address.
+    __u32 src_ip = ip->saddr;
+    __u32 dst_ip = ip->daddr;
+    
+    //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
+
+    // Get current threshold from map
+    key = 0;
+    struct ack_config config = {0};
+    struct ack_config * config_ptr = bpf_map_lookup_elem(&ack_config_map, &key);
+
+    if (!config_ptr) {
+        // Default value if map lookup fails
+        config.ack_threshold = ACK_THRESHOLD;
+        config.burst_pkt_threshold = ACK_BURST_PKT_THRESHOLD;
+        config.burst_count_threshold = ACK_BURST_COUNT_THRESHOLD;
+        config.ack_fixed_threshold = ACK_FIXED_THRESHOLD;
+        config.ack_fixed_check_duration = ACK_FIXED_CHECK_DURATION_NS;
+        config.burst_gap_ns = ACK_BURST_GAP_NS;
+    } else {
+        config.ack_threshold = config_ptr->ack_threshold;
+        config.burst_pkt_threshold = config_ptr->burst_pkt_threshold;
+        config.burst_count_threshold = config_ptr->burst_count_threshold;
+        config.ack_fixed_threshold = config_ptr->ack_fixed_threshold;
+        config.ack_fixed_check_duration = config_ptr->ack_fixed_check_duration;
+        config.burst_gap_ns = config_ptr->burst_gap_ns;
+    }
+
+    __u8 * ack_protect_mode = bpf_map_lookup_elem(&ack_attack_detect_map, &key);
+    if (!ack_protect_mode)
+        return XDP_PASS;
+
+    // If more than one second has passed, reset the counter.
+    if (now - counter->last_ts > ONE_SECOND_NS) {
+        if (counter->detected != *ack_protect_mode) {
+            if (counter->detected == 1) {
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
             } else {
-                stats1->count += 1;
+                struct event evt = {0};
+                evt.time = now;
+                evt.reason = EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END;
+                // Send the event to user space on the current CPU.
+                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
             }
-        } else {
-            struct ack_stats new_stats = { .count = 1, .last_ts = now };
-            bpf_map_update_elem(&ack_counter_1s, &src_ip, &new_stats, BPF_ANY);
         }
 
-        // Update 16-second counter.
-        struct ack_stats *stats16 = bpf_map_lookup_elem(&ack_counter_16s, &src_ip);
-        if (stats16) {
-            if (now - stats16->last_ts > SIXTEEN_SECONDS_NS) {
-                stats16->count = 1;
-                stats16->last_ts = now;
-            } else {
-                stats16->count += 1;
-            }
-        } else {
-            struct ack_stats new_stats = { .count = 1, .last_ts = now };
-            bpf_map_update_elem(&ack_counter_16s, &src_ip, &new_stats, BPF_ANY);
-        }
+        *ack_protect_mode = counter->detected;
 
-        // If either threshold is exceeded, block the IP for one hour.
-        if (stats1 && stats1->count > ACK_PPS_THRESHOLD) {
-            __u64 block_exp_time = now + BLOCK_DURATION_NS;
-            bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp_time, BPF_ANY);
-            bpf_printk("[ACK] %pI4:%d is added into blocked_ips with stats1\n", &src_ip, bpf_htons(tcp->source));
-            return XDP_DROP;
-        }
-        if (stats16 && stats16->count > ACK_FIXED_THRESHOLD) {
-            __u64 block_exp_time = now + BLOCK_DURATION_NS;
-            bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp_time, BPF_ANY);
-            bpf_printk("[ACK] %pI4:%d is added into blocked_ips with stats16\n", &src_ip, bpf_htons(tcp->source));
-            return XDP_DROP;
+        counter->last_ts = now;
+        counter->count = 1;
+        counter->detected = 0;
+    } else {
+        if (counter->detected == 0) {
+            counter->count += 1;
+            if (counter->count >= config.ack_threshold) {
+                bpf_printk("DEBUG: Global ACK pps reached %llu (threshold %d)\n", counter->count, config.ack_threshold);
+                if (*ack_protect_mode == 0 )
+                {
+                    struct event evt = {0};
+                    evt.time = now;
+                    evt.reason = EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START;
+                    // Send the event to user space on the current CPU.
+                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+                }
+                counter->detected = 1;
+                *ack_protect_mode = 1;
+            }
         }
     }
 
-    bpf_printk("[ACK] packet for %pI4:%d -----> %pI4:%d is filtered\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
+    if (*ack_protect_mode == 0)
+        return XDP_PASS;
 
+    /*
+     1. Check rate limite detection
+    */
+    // Look up per-source state
+    struct burst_state *state = bpf_map_lookup_elem(&burst_ack_state, &src_ip);
+    if (!state) {
+        // No existing state: initialize one
+        struct burst_state new_state = {0};
+        new_state.last_pkt_time = now;
+        new_state.current_burst_count = 1;
+        new_state.burst_count = 0;
+        new_state.last_reset = now;
+        bpf_map_update_elem(&burst_syn_state, &src_ip, &new_state, BPF_ANY);
+    }
+    else {
+        // Calculate total bursts (including current burst if it already reached threshold) 
+        __u32 total_bursts = state->burst_count;
+        if (state->current_burst_count >= config.burst_pkt_threshold) {
+            total_bursts++;
+        }
+        
+        // If bursts per second threshold is reached, block source IP 
+        if (total_bursts >= config.burst_count_threshold) {
+            __u64 expire = now + global_config_val.black_ip_duration;
+            bpf_map_update_elem(&blocked_ips, &src_ip, &expire, BPF_ANY);
+            bpf_printk("Blocked source IP %pI4: bursts = %d\n", &src_ip, total_bursts);
+
+            struct event evt = {0};
+            evt.time = now;
+            evt.srcip = src_ip;
+            evt.reason = EVENT_TCP_ACK_ATTACK_BURST_BLOCK;
+            // Send the event to user space on the current CPU.
+            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+
+            return XDP_DROP;
+        }
+
+        // Update state for each ACK packet 
+        if (now - state->last_reset >= ONE_SECOND_NS) { 
+            // Reset state for the new second
+            state->last_reset = now;
+            state->current_burst_count = 1;
+            state->burst_count = 0;
+            state->last_pkt_time = now;
+        } else {
+            // Within same one-second window 
+            if (now - state->last_pkt_time > config.burst_gap_ns) {
+                // Gap too long: the previous burst ends. 
+                // Only count it if it met the threshold.
+                if (state->current_burst_count >= config.burst_pkt_threshold) {
+                    state->burst_count++;
+                }
+                // Start a new burst
+                state->current_burst_count = 1;
+            } else {
+                // No gap: keep accumulating in current burst
+                state->current_burst_count++;
+            }
+            state->last_pkt_time = now;
+        }
+        //bpf_printk("DEBUG: Burst current_burst_count %d (burst_count %d)\n", state->current_burst_count, state->burst_count);
+    }
+
+    // Process the fixed check counter.
+    struct flood_stats *fixed_stats = bpf_map_lookup_elem(&ack_counter_fixed, &src_ip);
+    if (fixed_stats) {
+        if (now - fixed_stats->last_ts > config.ack_fixed_check_duration) {
+            fixed_stats->count = 1;
+            fixed_stats->last_ts = now;
+        } else {
+            fixed_stats->count += 1;
+        }
+
+    } else {
+        struct flood_stats new_stats = {0};
+        new_stats.detected = 0;
+        new_stats.count = 1;
+        new_stats.last_ts = now;
+        bpf_map_update_elem(&ack_counter_fixed, &src_ip, &new_stats, BPF_ANY);
+    }
+
+    // Check if either threshold is exceeded.
+
+    if (fixed_stats && fixed_stats->count > config.ack_fixed_threshold) {
+        __u64 block_exp = now + global_config_val.black_ip_duration;
+        bpf_map_update_elem(&blocked_ips, &src_ip, &block_exp, BPF_ANY);
+        bpf_printk("[ACK] IP %pI4 blocked for 15-second threshold\n", &src_ip);
+
+        struct event evt = {0};
+        evt.time = now;
+        evt.srcip = src_ip;
+        evt.reason = EVENT_TCP_ACK_ATTACK_FIXED_BLOCK;
+        // Send the event to user space on the current CPU.
+        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        
+        return XDP_DROP;
+    }
+    
     return XDP_PASS;
 }
 

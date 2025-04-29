@@ -16,6 +16,7 @@ struct {
     __type(value, struct global_config);
 } global_config_map SEC(".maps");
 
+
 /* Tail call map: keys will be used to jump to parse functions.
  * Key 0 -> xdp_parse_syn, 
    Key 1 -> xdp_parse_ack.
@@ -53,6 +54,12 @@ struct {
     __type(value, __u8);  // Temp value.
 } tcp_established_map SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct global_attack_stats);
+} global_attack_stats_map SEC(".maps");
 
 /*-------------------------------------------- Static Functions ------------------------------------*/
 static __always_inline __u16
@@ -178,18 +185,11 @@ struct {
 } syn_config_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u8);
-} syn_attack_detect_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct flood_stats);
-} global_syn_counter SEC(".maps");
+    __type(value, __u64);
+} global_syn_pkt_counter SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -250,10 +250,6 @@ int xdp_parse_syn(struct xdp_md *ctx) {
         global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
     }
 
-    struct flood_stats *counter = bpf_map_lookup_elem(&global_syn_counter, &key);
-    if (!counter)
-        return XDP_PASS;
-    
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
     __u32 dst_ip = ip->daddr;
@@ -284,53 +280,13 @@ int xdp_parse_syn(struct xdp_md *ctx) {
         config.syn_fixed_check_duration = config_ptr->syn_fixed_check_duration;
     }
 
-    __u8 * syn_protect_mode = bpf_map_lookup_elem(&syn_attack_detect_map, &key);
-    if (!syn_protect_mode)
-        return XDP_PASS;
-
-    // If more than one second has passed, reset the counter.
-    if (now - counter->last_ts > ONE_SECOND_NS) {
-        if (counter->detected != *syn_protect_mode) {
-            if (counter->detected == 1) {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            } else {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            }
-        }
-
-        *syn_protect_mode = counter->detected;
-
-        counter->last_ts = now;
-        counter->count = 1;
-        counter->detected = 0;
-    } else {
-        if (counter->detected == 0) {
-            counter->count += 1;
-            if (counter->count >= config.syn_threshold) {
-                //bpf_printk("DEBUG: Global SYN pps reached %llu (threshold %d)\n", counter->count, config.syn_threshold);
-                if (*syn_protect_mode == 0 )
-                {
-                    struct event evt = {0};
-                    evt.time = now;
-                    evt.reason = EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START;
-                    // Send the event to user space on the current CPU.
-                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-                }
-                counter->detected = 1;
-                *syn_protect_mode = 1;
-            }
-        }
-    }
-
-    if (*syn_protect_mode == 0)
+    __u64 *cnt = bpf_map_lookup_elem(&global_syn_pkt_counter, &key);
+    if (!cnt) return XDP_PASS;
+    __sync_fetch_and_add(cnt, 1);
+    
+    struct global_attack_stats * global_attack_stats_ptr = bpf_map_lookup_elem(&global_attack_stats_map, &key);
+    if (!global_attack_stats_ptr) return XDP_PASS;
+    if (global_attack_stats_ptr->syn_attack == 0)
         return XDP_PASS;
 
     /*
@@ -400,7 +356,6 @@ int xdp_parse_syn(struct xdp_md *ctx) {
         }
         //bpf_printk("DEBUG: Burst current_burst_count %d (burst_count %d)\n", state->current_burst_count, state->burst_count);
     }
-
 
     /*
      2. Check syn challenge validation
@@ -516,18 +471,11 @@ struct {
 } ack_config_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u8);
-} ack_attack_detect_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct flood_stats);
-} global_ack_counter SEC(".maps");
+    __type(value, __u64);
+} global_ack_pkt_counter SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -583,10 +531,6 @@ int xdp_parse_ack(struct xdp_md *ctx) {
         global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
     }
 
-    struct flood_stats *counter = bpf_map_lookup_elem(&global_ack_counter, &key);
-    if (!counter)
-        return XDP_PASS;
-    
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
     __u32 dst_ip = ip->daddr;
@@ -615,53 +559,13 @@ int xdp_parse_ack(struct xdp_md *ctx) {
         config.burst_gap_ns = config_ptr->burst_gap_ns;
     }
 
-    __u8 * ack_protect_mode = bpf_map_lookup_elem(&ack_attack_detect_map, &key);
-    if (!ack_protect_mode)
-        return XDP_PASS;
-
-    // If more than one second has passed, reset the counter.
-    if (now - counter->last_ts > ONE_SECOND_NS) {
-        if (counter->detected != *ack_protect_mode) {
-            if (counter->detected == 1) {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            } else {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            }
-        }
-
-        *ack_protect_mode = counter->detected;
-
-        counter->last_ts = now;
-        counter->count = 1;
-        counter->detected = 0;
-    } else {
-        if (counter->detected == 0) {
-            counter->count += 1;
-            if (counter->count >= config.ack_threshold) {
-                //bpf_printk("DEBUG: Global ACK pps reached %llu (threshold %d)\n", counter->count, config.ack_threshold);
-                if (*ack_protect_mode == 0 )
-                {
-                    struct event evt = {0};
-                    evt.time = now;
-                    evt.reason = EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START;
-                    // Send the event to user space on the current CPU.
-                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-                }
-                counter->detected = 1;
-                *ack_protect_mode = 1;
-            }
-        }
-    }
-
-    if (*ack_protect_mode == 0)
+    __u64 *cnt = bpf_map_lookup_elem(&global_ack_pkt_counter, &key);
+    if (!cnt) return XDP_PASS;
+    __sync_fetch_and_add(cnt, 1);
+    
+    struct global_attack_stats * global_attack_stats_ptr = bpf_map_lookup_elem(&global_attack_stats_map, &key);
+    if (!global_attack_stats_ptr) return XDP_PASS;
+    if (global_attack_stats_ptr->ack_attack == 0)
         return XDP_PASS;
 
     /*check limite detection if the source ip is not contained in tcp_established_map*/
@@ -790,18 +694,11 @@ struct {
 } rst_config_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u8);
-} rst_attack_detect_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct flood_stats);
-} global_rst_counter SEC(".maps");
+    __type(value, __u64);
+} global_rst_pkt_counter SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -857,10 +754,6 @@ int xdp_parse_rst(struct xdp_md *ctx) {
         global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
     }
 
-    struct flood_stats *counter = bpf_map_lookup_elem(&global_rst_counter, &key);
-    if (!counter)
-        return XDP_PASS;
-    
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
     __u32 dst_ip = ip->daddr;
@@ -889,53 +782,13 @@ int xdp_parse_rst(struct xdp_md *ctx) {
         config.burst_gap_ns = config_ptr->burst_gap_ns;
     }
 
-    __u8 * rst_protect_mode = bpf_map_lookup_elem(&rst_attack_detect_map, &key);
-    if (!rst_protect_mode)
-        return XDP_PASS;
-
-    // If more than one second has passed, reset the counter.
-    if (now - counter->last_ts > ONE_SECOND_NS) {
-        if (counter->detected != *rst_protect_mode) {
-            if (counter->detected == 1) {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_TCP_RST_ATTACK_PROTECION_MODE_START;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            } else {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_TCP_RST_ATTACK_PROTECION_MODE_END;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            }
-        }
-
-        *rst_protect_mode = counter->detected;
-
-        counter->last_ts = now;
-        counter->count = 1;
-        counter->detected = 0;
-    } else {
-        if (counter->detected == 0) {
-            counter->count += 1;
-            if (counter->count >= config.rst_threshold) {
-                //bpf_printk("DEBUG: Global RST pps reached %llu (threshold %d)\n", counter->count, config.rst_threshold);
-                if (*rst_protect_mode == 0 )
-                {
-                    struct event evt = {0};
-                    evt.time = now;
-                    evt.reason = EVENT_TCP_RST_ATTACK_PROTECION_MODE_START;
-                    // Send the event to user space on the current CPU.
-                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-                }
-                counter->detected = 1;
-                *rst_protect_mode = 1;
-            }
-        }
-    }
-
-    if (*rst_protect_mode == 0)
+    __u64 *cnt = bpf_map_lookup_elem(&global_rst_pkt_counter, &key);
+    if (!cnt) return XDP_PASS;
+    __sync_fetch_and_add(cnt, 1);
+    
+    struct global_attack_stats * global_attack_stats_ptr = bpf_map_lookup_elem(&global_attack_stats_map, &key);
+    if (!global_attack_stats_ptr) return XDP_PASS;
+    if (global_attack_stats_ptr->rst_attack == 0)
         return XDP_PASS;
 
     /*
@@ -1058,18 +911,11 @@ struct {
 } icmp_config_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u8);
-} icmp_attack_detect_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct flood_stats);
-} global_icmp_counter SEC(".maps");
+    __type(value, __u64);
+} global_icmp_pkt_counter SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -1122,10 +968,6 @@ int xdp_parse_icmp(struct xdp_md *ctx) {
     } else {
         global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
     }
-
-    struct flood_stats *counter = bpf_map_lookup_elem(&global_icmp_counter, &key);
-    if (!counter)
-        return XDP_PASS;
     
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
@@ -1155,53 +997,13 @@ int xdp_parse_icmp(struct xdp_md *ctx) {
         config.burst_gap_ns = config_ptr->burst_gap_ns;
     }
 
-    __u8 * icmp_protect_mode = bpf_map_lookup_elem(&icmp_attack_detect_map, &key);
-    if (!icmp_protect_mode)
-        return XDP_PASS;
-
-    // If more than one second has passed, reset the counter.
-    if (now - counter->last_ts > ONE_SECOND_NS) {
-        if (counter->detected != *icmp_protect_mode) {
-            if (counter->detected == 1) {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_ICMP_ATTACK_PROTECION_MODE_START;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            } else {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_ICMP_ATTACK_PROTECION_MODE_END;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            }
-        }
-
-        *icmp_protect_mode = counter->detected;
-
-        counter->last_ts = now;
-        counter->count = 1;
-        counter->detected = 0;
-    } else {
-        if (counter->detected == 0) {
-            counter->count += 1;
-            if (counter->count >= config.icmp_threshold) {
-                //bpf_printk("DEBUG: Global ICMP pps reached %llu (threshold %d)\n", counter->count, config.icmp_threshold);
-                if (*icmp_protect_mode == 0 )
-                {
-                    struct event evt = {0};
-                    evt.time = now;
-                    evt.reason = EVENT_ICMP_ATTACK_PROTECION_MODE_START;
-                    // Send the event to user space on the current CPU.
-                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-                }
-                counter->detected = 1;
-                *icmp_protect_mode = 1;
-            }
-        }
-    }
-
-    if (*icmp_protect_mode == 0)
+    __u64 *cnt = bpf_map_lookup_elem(&global_icmp_pkt_counter, &key);
+    if (!cnt) return XDP_PASS;
+    __sync_fetch_and_add(cnt, 1);
+    
+    struct global_attack_stats * global_attack_stats_ptr = bpf_map_lookup_elem(&global_attack_stats_map, &key);
+    if (!global_attack_stats_ptr) return XDP_PASS;
+    if (global_attack_stats_ptr->icmp_attack == 0)
         return XDP_PASS;
 
     /*
@@ -1323,18 +1125,11 @@ struct {
 } udp_config_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u8);
-} udp_attack_detect_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct flood_stats);
-} global_udp_counter SEC(".maps");
+    __type(value, __u64);
+} global_udp_pkt_counter SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -1389,10 +1184,6 @@ int xdp_parse_udp(struct xdp_md *ctx) {
     } else {
         global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
     }
-
-    struct flood_stats *counter = bpf_map_lookup_elem(&global_udp_counter, &key);
-    if (!counter)
-        return XDP_PASS;
     
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
@@ -1422,53 +1213,13 @@ int xdp_parse_udp(struct xdp_md *ctx) {
         config.burst_gap_ns = config_ptr->burst_gap_ns;
     }
 
-    __u8 * udp_protect_mode = bpf_map_lookup_elem(&udp_attack_detect_map, &key);
-    if (!udp_protect_mode)
-        return XDP_PASS;
-
-    // If more than one second has passed, reset the counter.
-    if (now - counter->last_ts > ONE_SECOND_NS) {
-        if (counter->detected != *udp_protect_mode) {
-            if (counter->detected == 1) {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_UDP_ATTACK_PROTECION_MODE_START;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            } else {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_UDP_ATTACK_PROTECION_MODE_END;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            }
-        }
-
-        *udp_protect_mode = counter->detected;
-
-        counter->last_ts = now;
-        counter->count = 1;
-        counter->detected = 0;
-    } else {
-        if (counter->detected == 0) {
-            counter->count += 1;
-            if (counter->count >= config.udp_threshold) {
-                //bpf_printk("DEBUG: Global UDP pps reached %llu (threshold %d)\n", counter->count, config.udp_threshold);
-                if (*udp_protect_mode == 0 )
-                {
-                    struct event evt = {0};
-                    evt.time = now;
-                    evt.reason = EVENT_UDP_ATTACK_PROTECION_MODE_START;
-                    // Send the event to user space on the current CPU.
-                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-                }
-                counter->detected = 1;
-                *udp_protect_mode = 1;
-            }
-        }
-    }
-
-    if (*udp_protect_mode == 0)
+    __u64 *cnt = bpf_map_lookup_elem(&global_udp_pkt_counter, &key);
+    if (!cnt) return XDP_PASS;
+    __sync_fetch_and_add(cnt, 1);
+    
+    struct global_attack_stats * global_attack_stats_ptr = bpf_map_lookup_elem(&global_attack_stats_map, &key);
+    if (!global_attack_stats_ptr) return XDP_PASS;
+    if (global_attack_stats_ptr->udp_attack == 0)
         return XDP_PASS;
 
     /*
@@ -1589,18 +1340,11 @@ struct {
 } gre_config_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u8);
-} gre_attack_detect_map SEC(".maps");
-
-struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, struct flood_stats);
-} global_gre_counter SEC(".maps");
+    __type(value, __u64);
+} global_gre_pkt_counter SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -1645,9 +1389,6 @@ int xdp_parse_gre(struct xdp_md *ctx) {
         global_config_val.black_ip_duration = global_config_ptr->black_ip_duration;
     }
 
-    struct flood_stats *counter = bpf_map_lookup_elem(&global_gre_counter, &key);
-    if (!counter) return XDP_PASS;
-
     __u32 src_ip = ip->saddr;
 
     // Get current threshold from map
@@ -1671,53 +1412,13 @@ int xdp_parse_gre(struct xdp_md *ctx) {
         config.burst_gap_ns = config_ptr->burst_gap_ns;
     }
 
-    __u8 * gre_protect_mode = bpf_map_lookup_elem(&gre_attack_detect_map, &key);
-    if (!gre_protect_mode)
-        return XDP_PASS;
-
-    // If more than one second has passed, reset the counter.
-    if (now - counter->last_ts > ONE_SECOND_NS) {
-        if (counter->detected != *gre_protect_mode) {
-            if (counter->detected == 1) {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_GRE_ATTACK_PROTECION_MODE_START;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            } else {
-                struct event evt = {0};
-                evt.time = now;
-                evt.reason = EVENT_GRE_ATTACK_PROTECION_MODE_END;
-                // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-            }
-        }
-
-        *gre_protect_mode = counter->detected;
-
-        counter->last_ts = now;
-        counter->count = 1;
-        counter->detected = 0;
-    } else {
-        if (counter->detected == 0) {
-            counter->count += 1;
-            if (counter->count >= config.gre_threshold) {
-                //bpf_printk("DEBUG: Global GRE pps reached %llu (threshold %d)\n", counter->count, config.gre_threshold);
-                if (*gre_protect_mode == 0 )
-                {
-                    struct event evt = {0};
-                    evt.time = now;
-                    evt.reason = EVENT_GRE_ATTACK_PROTECION_MODE_START;
-                    // Send the event to user space on the current CPU.
-                    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-                }
-                counter->detected = 1;
-                *gre_protect_mode = 1;
-            }
-        }
-    }
-
-    if (*gre_protect_mode == 0)
+    __u64 *cnt = bpf_map_lookup_elem(&global_gre_pkt_counter, &key);
+    if (!cnt) return XDP_PASS;
+    __sync_fetch_and_add(cnt, 1);
+    
+    struct global_attack_stats * global_attack_stats_ptr = bpf_map_lookup_elem(&global_attack_stats_map, &key);
+    if (!global_attack_stats_ptr) return XDP_PASS;
+    if (global_attack_stats_ptr->gre_attack == 0)
         return XDP_PASS;
 
     /*

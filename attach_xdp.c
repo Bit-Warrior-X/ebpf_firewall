@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <unistd.h> 
 #include <pthread.h>
 #include <net/if.h>
 #include <arpa/inet.h>
@@ -19,6 +20,58 @@
 char ifname[IFNAMSIZ];       // Network interface name
 __u32 attach_mode;           // Attach mode of ebpf
 long tz_offset_sec = 0;      // Timezone offset
+int n_cpus = 1;              // CPU count
+
+struct global_config gcfg = {0};
+
+struct syn_config syn_cfg = {
+    .syn_threshold = SYN_THRESHOLD,
+    .burst_pkt_threshold = SYN_BURST_PKT_THRESHOLD,
+    .burst_count_threshold = SYN_BURST_COUNT_THRESHOLD,
+    .challenge_timeout = SYN_CHALLENGE_TIMEOUT_NS,
+    .syn_fixed_threshold = SYN_FIXED_THRESHOLD,
+    .syn_fixed_check_duration = SYN_FIXED_CHECK_DURATION_NS,
+};
+
+struct ack_config ack_cfg = {
+    .ack_threshold = ACK_THRESHOLD,
+    .burst_pkt_threshold = ACK_BURST_PKT_THRESHOLD,
+    .burst_count_threshold = ACK_BURST_COUNT_THRESHOLD,
+    .ack_fixed_threshold = ACK_FIXED_THRESHOLD,
+    .ack_fixed_check_duration = ACK_FIXED_CHECK_DURATION_NS,
+};
+
+struct rst_config rst_cfg = {
+    .rst_threshold = RST_THRESHOLD,
+    .burst_pkt_threshold = RST_BURST_PKT_THRESHOLD,
+    .burst_count_threshold = RST_BURST_COUNT_THRESHOLD,
+    .rst_fixed_threshold = RST_FIXED_THRESHOLD,
+    .rst_fixed_check_duration = RST_FIXED_CHECK_DURATION_NS,
+};
+
+struct icmp_config icmp_cfg = {
+    .icmp_threshold = ICMP_THRESHOLD,
+    .burst_pkt_threshold = ICMP_BURST_PKT_THRESHOLD,
+    .burst_count_threshold = ICMP_BURST_COUNT_THRESHOLD,
+    .icmp_fixed_threshold = ICMP_FIXED_THRESHOLD,
+    .icmp_fixed_check_duration = ICMP_FIXED_CHECK_DURATION_NS,
+};
+
+struct udp_config udp_cfg = {
+    .udp_threshold = UDP_THRESHOLD,
+    .burst_pkt_threshold = UDP_BURST_PKT_THRESHOLD,
+    .burst_count_threshold = UDP_BURST_COUNT_THRESHOLD,
+    .udp_fixed_threshold = UDP_FIXED_THRESHOLD,
+    .udp_fixed_check_duration = UDP_FIXED_CHECK_DURATION_NS,
+};
+
+struct gre_config gre_cfg = {
+    .gre_threshold = GRE_THRESHOLD,
+    .burst_pkt_threshold = GRE_BURST_PKT_THRESHOLD,
+    .burst_count_threshold = GRE_BURST_COUNT_THRESHOLD,
+    .gre_fixed_threshold = GRE_FIXED_THRESHOLD,
+    .gre_fixed_check_duration = GRE_FIXED_CHECK_DURATION_NS,
+};
 
 static int event_cb(enum nf_conntrack_msg_type type,
                     struct nf_conntrack *ct,
@@ -98,6 +151,11 @@ static long get_timezone_offset() {
     return offset;
 }
 
+static int calc_cpus_count(void)
+{
+    return sysconf(_SC_NPROCESSORS_CONF);
+}
+
 /* 
  * Initialize the time offset:
  *   time_offset = current_realtime - current_monotonic.
@@ -125,22 +183,89 @@ static int init_time_offset(void)
     return 0;
 }
 
+void print_firewall_status(struct tm * tm_info, int reason, __u32 srcip) {
+
+    char src[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &srcip, src, sizeof(src));
+
+    char buffer[26];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    // Print the timestamp only once at the beginning
+    printf("%s    ", buffer);
+
+    if (reason == EVENT_IP_BLOCK_END) {
+        printf("EVENT_IP_BLOCK_END %s\n", src);
+    } else if (reason == EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START\n");
+    } else if (reason == EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END\n");
+    } else if (reason == EVENT_TCP_SYN_ATTACK_BURST_BLOCK) {
+        printf("EVENT_TCP_SYN_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (reason == EVENT_TCP_SYN_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_TCP_SYN_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+    
+    else if (reason == EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START\n");
+    } else if (reason == EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END\n");
+    } else if (reason == EVENT_TCP_ACK_ATTACK_BURST_BLOCK) {
+        printf("EVENT_TCP_ACK_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (reason == EVENT_TCP_ACK_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_TCP_ACK_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+
+    else if (reason == EVENT_TCP_RST_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_TCP_RST_ATTACK_PROTECION_MODE_START\n");
+    } else if (reason == EVENT_TCP_RST_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_TCP_RST_ATTACK_PROTECION_MODE_END\n");
+    } else if (reason == EVENT_TCP_RST_ATTACK_BURST_BLOCK) {
+        printf("EVENT_TCP_RST_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (reason == EVENT_TCP_RST_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_TCP_RST_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+
+    else if (reason == EVENT_ICMP_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_ICMP_ATTACK_PROTECION_MODE_START\n");
+    } else if (reason == EVENT_ICMP_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_ICMP_ATTACK_PROTECION_MODE_END\n");
+    } else if (reason == EVENT_ICMP_ATTACK_BURST_BLOCK) {
+        printf("EVENT_ICMP_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (reason == EVENT_ICMP_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_ICMP_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+
+    else if (reason == EVENT_UDP_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_UDP_ATTACK_PROTECION_MODE_START\n");
+    } else if (reason == EVENT_UDP_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_UDP_ATTACK_PROTECION_MODE_END\n");
+    } else if (reason == EVENT_UDP_ATTACK_BURST_BLOCK) {
+        printf("EVENT_UDP_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (reason == EVENT_UDP_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_UDP_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+
+    else if (reason == EVENT_GRE_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_GRE_ATTACK_PROTECION_MODE_START\n");
+    } else if (reason == EVENT_GRE_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_GRE_ATTACK_PROTECION_MODE_END\n");
+    } else if (reason == EVENT_GRE_ATTACK_BURST_BLOCK) {
+        printf("EVENT_GRE_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (reason == EVENT_GRE_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_GRE_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+}
 
 // Callback function invoked for each perf event.
 static void handle_event(void *ctx, int cpu, void *data, __u32 size)
 {
     struct event *e = data;
-    char src[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &e->srcip, src, sizeof(src));
-    
     /* Convert monotonic time to real time by adding the offset */
     __u64 real_time_ns = e->time + time_offset_ns;
     /* Apply timezone offset (CST = UTC+8) */
-
     real_time_ns += tz_offset_sec * ONE_SECOND_NS;
-
     time_t seconds = real_time_ns / ONE_SECOND_NS;
-    long nanos = real_time_ns % ONE_SECOND_NS;
 
     struct tm tm_info;
     if (localtime_r(&seconds, &tm_info) == NULL) {
@@ -148,73 +273,7 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
         return;
     }
 
-    char buffer[26];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm_info);
-
-    // Print the timestamp only once at the beginning
-    printf("%s.%09ld    [cpu %d]    ", buffer, nanos, cpu);
-
-    if (e->reason == EVENT_IP_BLOCK_END) {
-        printf("EVENT_IP_BLOCK_END %s\n", src);
-    } else if (e->reason == EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START) {
-        printf("EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START\n");
-    } else if (e->reason == EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END) {
-        printf("EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END\n");
-    } else if (e->reason == EVENT_TCP_SYN_ATTACK_BURST_BLOCK) {
-        printf("EVENT_TCP_SYN_ATTACK_BURST_BLOCK %s\n", src);
-    } else if (e->reason == EVENT_TCP_SYN_ATTACK_FIXED_BLOCK) {
-        printf("EVENT_TCP_SYN_ATTACK_FIXED_BLOCK %s\n", src);
-    }
-    
-    else if (e->reason == EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START) {
-        printf("EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START\n");
-    } else if (e->reason == EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END) {
-        printf("EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END\n");
-    } else if (e->reason == EVENT_TCP_ACK_ATTACK_BURST_BLOCK) {
-        printf("EVENT_TCP_ACK_ATTACK_BURST_BLOCK %s\n", src);
-    } else if (e->reason == EVENT_TCP_ACK_ATTACK_FIXED_BLOCK) {
-        printf("EVENT_TCP_ACK_ATTACK_FIXED_BLOCK %s\n", src);
-    }
-
-    else if (e->reason == EVENT_TCP_RST_ATTACK_PROTECION_MODE_START) {
-        printf("EVENT_TCP_RST_ATTACK_PROTECION_MODE_START\n");
-    } else if (e->reason == EVENT_TCP_RST_ATTACK_PROTECION_MODE_END) {
-        printf("EVENT_TCP_RST_ATTACK_PROTECION_MODE_END\n");
-    } else if (e->reason == EVENT_TCP_RST_ATTACK_BURST_BLOCK) {
-        printf("EVENT_TCP_RST_ATTACK_BURST_BLOCK %s\n", src);
-    } else if (e->reason == EVENT_TCP_RST_ATTACK_FIXED_BLOCK) {
-        printf("EVENT_TCP_RST_ATTACK_FIXED_BLOCK %s\n", src);
-    }
-
-    else if (e->reason == EVENT_ICMP_ATTACK_PROTECION_MODE_START) {
-        printf("EVENT_ICMP_ATTACK_PROTECION_MODE_START\n");
-    } else if (e->reason == EVENT_ICMP_ATTACK_PROTECION_MODE_END) {
-        printf("EVENT_ICMP_ATTACK_PROTECION_MODE_END\n");
-    } else if (e->reason == EVENT_ICMP_ATTACK_BURST_BLOCK) {
-        printf("EVENT_ICMP_ATTACK_BURST_BLOCK %s\n", src);
-    } else if (e->reason == EVENT_ICMP_ATTACK_FIXED_BLOCK) {
-        printf("EVENT_ICMP_ATTACK_FIXED_BLOCK %s\n", src);
-    }
-
-    else if (e->reason == EVENT_UDP_ATTACK_PROTECION_MODE_START) {
-        printf("EVENT_UDP_ATTACK_PROTECION_MODE_START\n");
-    } else if (e->reason == EVENT_UDP_ATTACK_PROTECION_MODE_END) {
-        printf("EVENT_UDP_ATTACK_PROTECION_MODE_END\n");
-    } else if (e->reason == EVENT_UDP_ATTACK_BURST_BLOCK) {
-        printf("EVENT_UDP_ATTACK_BURST_BLOCK %s\n", src);
-    } else if (e->reason == EVENT_UDP_ATTACK_FIXED_BLOCK) {
-        printf("EVENT_UDP_ATTACK_FIXED_BLOCK %s\n", src);
-    }
-
-    else if (e->reason == EVENT_GRE_ATTACK_PROTECION_MODE_START) {
-        printf("EVENT_GRE_ATTACK_PROTECION_MODE_START\n");
-    } else if (e->reason == EVENT_GRE_ATTACK_PROTECION_MODE_END) {
-        printf("EVENT_GRE_ATTACK_PROTECION_MODE_END\n");
-    } else if (e->reason == EVENT_GRE_ATTACK_BURST_BLOCK) {
-        printf("EVENT_GRE_ATTACK_BURST_BLOCK %s\n", src);
-    } else if (e->reason == EVENT_GRE_ATTACK_FIXED_BLOCK) {
-        printf("EVENT_GRE_ATTACK_FIXED_BLOCK %s\n", src);
-    }
+    print_firewall_status(&tm_info, e->reason, e->srcip);
 }
 
 /* Lost events callback (optional) */
@@ -250,63 +309,14 @@ static int load_config(struct bpf_object *obj) {
     }
 
     // Set default values
-    struct global_config gcfg = {0};
+    
     strncpy(ifname, "eth0", IFNAMSIZ);
     ifname[IFNAMSIZ-1] = '\0';
+    n_cpus = calc_cpus_count();
 
     attach_mode = XDP_FLAGS_DRV_MODE;
     tz_offset_sec = get_timezone_offset();
     gcfg.black_ip_duration = BLOCK_DURATION_NS;
-
-    // Initialize SYN config with defaults
-    struct syn_config syn_cfg = {
-        .syn_threshold = SYN_THRESHOLD,
-        .burst_pkt_threshold = SYN_BURST_PKT_THRESHOLD,
-        .burst_count_threshold = SYN_BURST_COUNT_THRESHOLD,
-        .challenge_timeout = SYN_CHALLENGE_TIMEOUT_NS,
-        .syn_fixed_threshold = SYN_FIXED_THRESHOLD,
-        .syn_fixed_check_duration = SYN_FIXED_CHECK_DURATION_NS,
-    };
-
-    struct ack_config ack_cfg = {
-        .ack_threshold = ACK_THRESHOLD,
-        .burst_pkt_threshold = ACK_BURST_PKT_THRESHOLD,
-        .burst_count_threshold = ACK_BURST_COUNT_THRESHOLD,
-        .ack_fixed_threshold = ACK_FIXED_THRESHOLD,
-        .ack_fixed_check_duration = ACK_FIXED_CHECK_DURATION_NS,
-    };
-
-    struct rst_config rst_cfg = {
-        .rst_threshold = RST_THRESHOLD,
-        .burst_pkt_threshold = RST_BURST_PKT_THRESHOLD,
-        .burst_count_threshold = RST_BURST_COUNT_THRESHOLD,
-        .rst_fixed_threshold = RST_FIXED_THRESHOLD,
-        .rst_fixed_check_duration = RST_FIXED_CHECK_DURATION_NS,
-    };
-
-    struct icmp_config icmp_cfg = {
-        .icmp_threshold = ICMP_THRESHOLD,
-        .burst_pkt_threshold = ICMP_BURST_PKT_THRESHOLD,
-        .burst_count_threshold = ICMP_BURST_COUNT_THRESHOLD,
-        .icmp_fixed_threshold = ICMP_FIXED_THRESHOLD,
-        .icmp_fixed_check_duration = ICMP_FIXED_CHECK_DURATION_NS,
-    };
-
-    struct udp_config udp_cfg = {
-        .udp_threshold = UDP_THRESHOLD,
-        .burst_pkt_threshold = UDP_BURST_PKT_THRESHOLD,
-        .burst_count_threshold = UDP_BURST_COUNT_THRESHOLD,
-        .udp_fixed_threshold = UDP_FIXED_THRESHOLD,
-        .udp_fixed_check_duration = UDP_FIXED_CHECK_DURATION_NS,
-    };
-
-    struct gre_config gre_cfg = {
-        .gre_threshold = GRE_THRESHOLD,
-        .burst_pkt_threshold = GRE_BURST_PKT_THRESHOLD,
-        .burst_count_threshold = GRE_BURST_COUNT_THRESHOLD,
-        .gre_fixed_threshold = GRE_FIXED_THRESHOLD,
-        .gre_fixed_check_duration = GRE_FIXED_CHECK_DURATION_NS,
-    };
 
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), fp)) {
@@ -555,6 +565,245 @@ static int load_config(struct bpf_object *obj) {
     return 0;
 }
 
+static void * global_attack_check_worker(void * arg) {
+
+    size_t vsize = sizeof(__u64) * n_cpus;
+    __u64 *values = calloc(n_cpus, sizeof(__u64));
+    
+    struct bpf_object *obj = (struct bpf_object*)arg;
+
+    int global_attack_stats_map_fd;
+    int global_syn_pkt_counter_map_fd, global_ack_pkt_counter_map_fd, global_rst_pkt_counter_map_fd, global_icmp_pkt_counter_map_fd, global_udp_pkt_counter_map_fd, global_gre_pkt_counter_map_fd;
+
+    global_attack_stats_map_fd = bpf_object__find_map_fd_by_name(obj, "global_attack_stats_map");
+    if (global_attack_stats_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_attack_stats_map eBPF map\n");
+        goto cleanup;
+    }
+
+    global_syn_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_syn_pkt_counter");
+    if (global_syn_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_syn_pkt_counter eBPF map\n");
+        goto cleanup;
+    }
+
+    global_ack_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_ack_pkt_counter");
+    if (global_ack_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_ack_pkt_counter eBPF map\n");
+        goto cleanup;
+    }
+
+    global_rst_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_rst_pkt_counter");
+    if (global_rst_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_rst_pkt_counter eBPF map\n");
+        goto cleanup;
+    }
+
+    global_icmp_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_icmp_pkt_counter");
+    if (global_icmp_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_icmp_pkt_counter eBPF map\n");
+        goto cleanup;
+    }
+
+    global_udp_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_udp_pkt_counter");
+    if (global_udp_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_udp_pkt_counter eBPF map\n");
+        goto cleanup;
+    }
+
+    global_gre_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_gre_pkt_counter");
+    if (global_gre_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_gre_pkt_counter eBPF map\n");
+        goto cleanup;
+    }
+
+    while (!exiting) {
+        __u32 key = 0;
+        time_t now = time(NULL);     /* current epoch seconds */
+        //printf("[Global statistic] check @ %s", ctime(&now));   /* ctime() adds \n */
+
+        struct global_attack_stats global_attack_stats_val;
+        if (bpf_map_lookup_elem(global_attack_stats_map_fd, &key, &global_attack_stats_val)) {
+            fprintf(stderr, "bpf_map_lookup_elem");
+            goto cleanup;
+        }
+        
+        __u64 total_syn_cnt = 0;
+        if (bpf_map_lookup_elem(global_syn_pkt_counter_map_fd, &key, values)) {
+            fprintf(stderr, "bpf_map_lookup_elem");
+            goto cleanup;
+        }
+        for (int cpu = 0; cpu < n_cpus; cpu++) {
+            total_syn_cnt += values[cpu];
+        }
+        memset(values, 0, vsize);
+        if (bpf_map_update_elem(global_syn_pkt_counter_map_fd, &key, values, 0)) {
+            fprintf(stderr, "bpf_map_update_elem");
+            goto cleanup;
+        }
+
+        __u64 total_ack_cnt = 0;
+        if (bpf_map_lookup_elem(global_ack_pkt_counter_map_fd, &key, values)) {
+            fprintf(stderr, "bpf_map_lookup_elem");
+            goto cleanup;
+        }
+        for (int cpu = 0; cpu < n_cpus; cpu++) {
+            total_ack_cnt += values[cpu];
+        }
+        memset(values, 0, vsize);
+        if (bpf_map_update_elem(global_ack_pkt_counter_map_fd, &key, values, 0)) {
+            fprintf(stderr, "bpf_map_update_elem");
+            goto cleanup;
+        }
+
+        __u64 total_rst_cnt = 0;
+        if (bpf_map_lookup_elem(global_rst_pkt_counter_map_fd, &key, values)) {
+            fprintf(stderr, "bpf_map_lookup_elem");
+            goto cleanup;
+        }
+        for (int cpu = 0; cpu < n_cpus; cpu++) {
+            total_rst_cnt += values[cpu];
+        }
+        memset(values, 0, vsize);
+        if (bpf_map_update_elem(global_rst_pkt_counter_map_fd, &key, values, 0)) {
+            fprintf(stderr, "bpf_map_update_elem");
+            goto cleanup;
+        }
+
+        __u64 total_icmp_cnt = 0;
+        if (bpf_map_lookup_elem(global_icmp_pkt_counter_map_fd, &key, values)) {
+            fprintf(stderr, "bpf_map_lookup_elem");
+            goto cleanup;
+        }
+        for (int cpu = 0; cpu < n_cpus; cpu++) {
+            total_icmp_cnt += values[cpu];
+        }
+        memset(values, 0, vsize);
+        if (bpf_map_update_elem(global_icmp_pkt_counter_map_fd, &key, values, 0)) {
+            fprintf(stderr, "bpf_map_update_elem");
+            goto cleanup;
+        }
+
+        __u64 total_udp_cnt = 0;
+        if (bpf_map_lookup_elem(global_udp_pkt_counter_map_fd, &key, values)) {
+            fprintf(stderr, "bpf_map_lookup_elem");
+            goto cleanup;
+        }
+        for (int cpu = 0; cpu < n_cpus; cpu++) {
+            total_udp_cnt += values[cpu];
+        }
+        memset(values, 0, vsize);
+        if (bpf_map_update_elem(global_udp_pkt_counter_map_fd, &key, values, 0)) {
+            fprintf(stderr, "bpf_map_update_elem");
+            goto cleanup;
+        }
+
+        __u64 total_gre_cnt = 0;
+        if (bpf_map_lookup_elem(global_gre_pkt_counter_map_fd, &key, values)) {
+            fprintf(stderr, "bpf_map_lookup_elem");
+            goto cleanup;
+        }
+        for (int cpu = 0; cpu < n_cpus; cpu++) {
+            total_gre_cnt += values[cpu];
+        }
+        memset(values, 0, vsize);
+        if (bpf_map_update_elem(global_gre_pkt_counter_map_fd, &key, values, 0)) {
+            fprintf(stderr, "bpf_map_update_elem");
+            goto cleanup;
+        }
+
+        time_t rawtime;
+        struct tm *tm_info;
+        time(&rawtime);
+        tm_info = localtime(&rawtime);
+
+        __u8 need_to_update = false;
+        __u8 syn_attack = false, ack_attack = false, rst_attack = false, icmp_attack = false, udp_attack = false, gre_attack = false;
+
+        if (total_syn_cnt >= syn_cfg.syn_threshold) syn_attack = true;
+        else syn_attack = false;
+        if (syn_attack != global_attack_stats_val.syn_attack) {
+            if (syn_attack == true) {
+                print_firewall_status(tm_info, EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START, 0);
+            } else {
+                print_firewall_status(tm_info, EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END, 0);
+            }
+            global_attack_stats_val.syn_attack = syn_attack;
+            need_to_update = true;
+        }
+
+        if (total_ack_cnt >= ack_cfg.ack_threshold) ack_attack = true;
+        else ack_attack = false;
+        if (ack_attack != global_attack_stats_val.ack_attack) {
+            if (ack_attack == true) {
+                print_firewall_status(tm_info, EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START, 0);
+            } else {
+                print_firewall_status(tm_info, EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END, 0);
+            }
+            global_attack_stats_val.ack_attack = ack_attack;
+            need_to_update = true;
+        }
+
+        if (total_rst_cnt >= rst_cfg.rst_threshold) rst_attack = true;
+        else rst_attack = false;
+        if (rst_attack != global_attack_stats_val.rst_attack) {
+            if (rst_attack == true) {
+                print_firewall_status(tm_info, EVENT_TCP_RST_ATTACK_PROTECION_MODE_START, 0);
+            } else {
+                print_firewall_status(tm_info, EVENT_TCP_RST_ATTACK_PROTECION_MODE_END, 0);
+            }
+            global_attack_stats_val.rst_attack = rst_attack;
+            need_to_update = true;
+        }
+
+        if (total_icmp_cnt >= icmp_cfg.icmp_threshold) icmp_attack = true;
+        else icmp_attack = false;
+        if (icmp_attack != global_attack_stats_val.icmp_attack) {
+            if (icmp_attack == true) {
+                print_firewall_status(tm_info, EVENT_ICMP_ATTACK_PROTECION_MODE_START, 0);
+            } else {
+                print_firewall_status(tm_info, EVENT_ICMP_ATTACK_PROTECION_MODE_END, 0);
+            }
+            global_attack_stats_val.icmp_attack = icmp_attack;
+            need_to_update = true;
+        }
+
+        if (total_udp_cnt >= udp_cfg.udp_threshold) udp_attack = true;
+        else udp_attack = false;
+        if (udp_attack != global_attack_stats_val.udp_attack) {
+            if (udp_attack == true) {
+                print_firewall_status(tm_info, EVENT_UDP_ATTACK_PROTECION_MODE_START, 0);
+            } else {
+                print_firewall_status(tm_info, EVENT_UDP_ATTACK_PROTECION_MODE_END, 0);
+            }
+            global_attack_stats_val.udp_attack = udp_attack;
+            need_to_update = true;
+        }
+
+        if (total_gre_cnt >= gre_cfg.gre_threshold) gre_attack = true;
+        else gre_attack = false;
+        if (gre_attack != global_attack_stats_val.gre_attack) {
+            if (gre_attack == true) {
+                print_firewall_status(tm_info, EVENT_GRE_ATTACK_PROTECION_MODE_START, 0);
+            } else {
+                print_firewall_status(tm_info, EVENT_GRE_ATTACK_PROTECION_MODE_END, 0);
+            }
+            global_attack_stats_val.gre_attack = gre_attack;
+            need_to_update = true;
+        }
+
+
+        if (need_to_update == true)
+            bpf_map_update_elem(global_attack_stats_map_fd, &key, &global_attack_stats_val, 0);
+
+        sleep (1);
+    }
+
+cleanup:
+    if (values) free (values);
+    return NULL;
+}
+
 
 int main(int argc, char **argv) {
     
@@ -711,7 +960,16 @@ int main(int argc, char **argv) {
     nfct_callback_register(cth, NFCT_T_ALL, event_cb, &tcp_established_map_fd);
 
     pthread_t ct_thr; 
-    pthread_create(&ct_thr, NULL, (void *(*)(void *))nfct_catch, cth);
+    if (pthread_create(&ct_thr, NULL, (void *(*)(void *))nfct_catch, cth) != 0) {
+        perror("pthread_create for ct_thr");
+        goto cleanup;
+    }
+
+    pthread_t global_attack_ch_thr;
+    if (pthread_create(&global_attack_ch_thr, NULL, global_attack_check_worker, obj) != 0) {
+        perror("pthread_create for global_attack_ch_thr");
+        goto cleanup;
+    }
 
     printf("XDP program successfully attached to interface %s (ifindex %d)\n", ifname, ifindex);
     printf("Press Ctrl+C to exit and detach the program.\n");

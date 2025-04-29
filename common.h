@@ -103,6 +103,15 @@ struct flood_stats {
     __u64 last_ts;
 };
 
+struct global_attack_stats {
+    __u8 syn_attack;
+    __u8 ack_attack;
+    __u8 rst_attack;
+    __u8 icmp_attack;
+    __u8 udp_attack;
+    __u8 gre_attack;
+};
+
 // Per-source state for SYN packet bursts.
 struct burst_state {
     __u64 last_pkt_time;       /* Timestamp of the last SYN packet */

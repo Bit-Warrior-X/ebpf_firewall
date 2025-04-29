@@ -47,6 +47,13 @@
 #define UDP_FIXED_CHECK_DURATION_NS (15ULL * ONE_SECOND_NS)    // 15 seconds for fixed duration check
 #define UDP_BURST_GAP_NS            ONE_SECOND_NS / UDP_BURST_PKT_THRESHOLD
 
+#define GRE_THRESHOLD               200000                     // 200K GRE packets per second
+#define GRE_BURST_COUNT_THRESHOLD   10                         /* bursts per sec */
+#define GRE_BURST_PKT_THRESHOLD     20                         /* Each burst must have >=20 GRE packets */
+#define GRE_FIXED_THRESHOLD         20000                      // 15‑sec window
+#define GRE_FIXED_CHECK_DURATION_NS (15ULL * ONE_SECOND_NS)
+#define GRE_BURST_GAP_NS            ONE_SECOND_NS / GRE_BURST_PKT_THRESHOLD
+
 #define EVENT_IP_BLOCK_END                         0
 #define EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START  10
 #define EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END    11
@@ -72,6 +79,12 @@
 #define EVENT_UDP_ATTACK_PROTECION_MODE_END        51
 #define EVENT_UDP_ATTACK_BURST_BLOCK               52
 #define EVENT_UDP_ATTACK_FIXED_BLOCK               53
+
+
+#define EVENT_GRE_ATTACK_PROTECION_MODE_START      60
+#define EVENT_GRE_ATTACK_PROTECION_MODE_END        61
+#define EVENT_GRE_ATTACK_BURST_BLOCK               62
+#define EVENT_GRE_ATTACK_FIXED_BLOCK               63
 
 struct global_config {
     __u64 black_ip_duration;     // Blacklist duration in seconds
@@ -144,18 +157,41 @@ struct udp_config {
     __u64 udp_fixed_check_duration;
 };
 
+struct gre_config {
+    __u32 gre_threshold;
+    __u64 burst_gap_ns;
+    __u32 burst_pkt_threshold;
+    __u64 burst_count_threshold;
+    __u32 gre_fixed_threshold;
+    __u64 gre_fixed_check_duration;
+};
+
 // New structure and map for the SYN challenge state.
 struct challenge_state {
     __u8 stage;       // 1: first SYN seen; 2: challenge sent (waiting for client response)
     __u64 ts;         // Timestamp when state was updated
     __u32 seq;        // Seq Number of syn
-    __u32 wrong_seq;  // An arbitrary “wrong” sequence number to send in our challenge SYN+ACK.
 };
 
-
-enum event_reason {
-    EVENT_TCP_ACK_VALID = 1,
-    EVENT_TCP_ACK_INVALID = 2,
+struct icmphdr
+{
+  __u8 type;                /* message type */
+  __u8 code;                /* type sub-code */
+  __u16 checksum;
+  union
+  {
+    struct
+    {
+      __u16        id;
+      __u16        sequence;
+    } echo;                        /* echo datagram */
+    __u32        gateway;        /* gateway address */
+    struct
+    {
+      __u16        __unused;
+      __u16        mtu;
+    } frag;                        /* path mtu discovery */
+  } un;
 };
 
 struct tcp_session {
@@ -164,5 +200,7 @@ struct tcp_session {
     __u32 dst_ip;    // in network byte order
     __u16 dst_port;  // in network byte order
 } __attribute__((packed));
+
+
 
 #endif

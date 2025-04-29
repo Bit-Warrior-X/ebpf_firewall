@@ -123,6 +123,10 @@ int main(void)
     nfct_callback_register(h, NFCT_T_ALL, event_cb, NULL);
     ret = nfct_catch(h);
     printf("test ret=%d (%s)\n", ret, strerror(errno));
-
+    
+    while (1) {
+        printf("while loop output every one second");
+        sleep (1);
+    }
     return EXIT_SUCCESS;
 }

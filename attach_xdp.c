@@ -2,8 +2,11 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
+#include <pthread.h>
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
@@ -15,65 +18,54 @@
 // Global configuration
 char ifname[IFNAMSIZ];       // Network interface name
 __u32 attach_mode;           // Attach mode of ebpf
+long tz_offset_sec = 0;      // Timezone offset
 
 static int event_cb(enum nf_conntrack_msg_type type,
                     struct nf_conntrack *ct,
                     void *data)
 {
-    struct tcp_session session = {0};
+    __u32 srcip = 0;
+    __u16 src_port = 0;
     __u8 value = 1;
     int err;
-    int sessions_map_fd = *(int*)data;
+    
+    if (data == NULL)
+        return NFCT_CB_CONTINUE;
 
-    char buf[1024];
-    nfct_snprintf(buf, sizeof(buf), ct, type, NFCT_O_DEFAULT, 0);
-    printf("Conntrack event: %s\n", buf);
+    int tcp_established_map_fd = *(int*)data;
 
-    /* Only handle TCP connections.
-     * Use nfct_get_attr_u8() to retrieve the protocol.
-     */
     uint8_t proto = nfct_get_attr_u8(ct, ATTR_ORIG_L4PROTO);
     if (proto != IPPROTO_TCP)
         return NFCT_CB_CONTINUE;
 
-    /* Retrieve connection attributes.
-     * Note: It's a good idea to check return values, but here we assume success.
-     */
-    session.src_ip = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_SRC);
-    if (session.src_ip < 0)
+    srcip = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_SRC);
+    if (srcip <= 0)
+       return NFCT_CB_CONTINUE;
+
+    src_port = nfct_get_attr_u16(ct, ATTR_ORIG_PORT_SRC);
+    if (src_port < 0)
         return NFCT_CB_CONTINUE;
+
+    __u64 key = src_port;
+    key = ((key << 32) | srcip);
+
+    uint8_t tcp_state = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
     
-    session.dst_ip = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_DST);
-    if (session.dst_ip < 0)
-        return NFCT_CB_CONTINUE;
-    
-    session.src_port = nfct_get_attr_u16(ct, ATTR_ORIG_PORT_SRC);
-    if (session.src_port < 0)
-        return NFCT_CB_CONTINUE;
-
-    session.dst_port = nfct_get_attr_u16(ct, ATTR_ORIG_PORT_DST);
-    if (session.dst_port < 0)
-        return NFCT_CB_CONTINUE;
-
-    /* For debugging, you might want to print the session information in hex,
-     * but be careful with printing from kernel code.
-     */
-
-    printf("sessions_map_fd is %d, seesion is (%d:%d -> %d:%d)", sessions_map_fd, session.src_ip, session.src_port, session.dst_ip, session.dst_port);
-
     switch (type) {
     case NFCT_T_NEW:
+        break;
     case NFCT_T_UPDATE:
-        /* Update the BPF sessions map with the session key.
-         * Here we use the global sessions_map_fd that was obtained during initialization.
-         */
-        err = bpf_map_update_elem(sessions_map_fd, &session, &value, BPF_ANY);
-        if (err) {
-            fprintf(stderr, "Failed to update session map: %d\n", err);
+        if (tcp_state == 3) { //Established
+            printf("Established source is %x:%d\n", htonl(srcip), htons(src_port));
+            err = bpf_map_update_elem(tcp_established_map_fd, &key, &value, BPF_ANY);
+            if (err) {
+                fprintf(stderr, "Failed to update tcp_established_session map: %d\n", err);
+            }
         }
         break;
     case NFCT_T_DESTROY:
-        bpf_map_delete_elem(sessions_map_fd, &session);
+        printf("Destroy source is %x:%d\n", htonl(srcip), htons(src_port));
+        bpf_map_delete_elem(tcp_established_map_fd, &key);
         break;
     default:
         break;
@@ -81,6 +73,8 @@ static int event_cb(enum nf_conntrack_msg_type type,
 
     return NFCT_CB_CONTINUE;
 }
+
+
 /* Global time offset (in nanoseconds) to convert from monotonic to real time */
 static __u64 time_offset_ns = 0;
 
@@ -137,13 +131,12 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
 {
     struct event *e = data;
     char src[INET_ADDRSTRLEN];
-
     inet_ntop(AF_INET, &e->srcip, src, sizeof(src));
-
+    
     /* Convert monotonic time to real time by adding the offset */
     __u64 real_time_ns = e->time + time_offset_ns;
     /* Apply timezone offset (CST = UTC+8) */
-    long tz_offset_sec = get_timezone_offset();
+
     real_time_ns += tz_offset_sec * ONE_SECOND_NS;
 
     time_t seconds = real_time_ns / ONE_SECOND_NS;
@@ -171,6 +164,56 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
         printf("EVENT_TCP_SYN_ATTACK_BURST_BLOCK %s\n", src);
     } else if (e->reason == EVENT_TCP_SYN_ATTACK_FIXED_BLOCK) {
         printf("EVENT_TCP_SYN_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+    
+    else if (e->reason == EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START\n");
+    } else if (e->reason == EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END\n");
+    } else if (e->reason == EVENT_TCP_ACK_ATTACK_BURST_BLOCK) {
+        printf("EVENT_TCP_ACK_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (e->reason == EVENT_TCP_ACK_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_TCP_ACK_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+
+    else if (e->reason == EVENT_TCP_RST_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_TCP_RST_ATTACK_PROTECION_MODE_START\n");
+    } else if (e->reason == EVENT_TCP_RST_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_TCP_RST_ATTACK_PROTECION_MODE_END\n");
+    } else if (e->reason == EVENT_TCP_RST_ATTACK_BURST_BLOCK) {
+        printf("EVENT_TCP_RST_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (e->reason == EVENT_TCP_RST_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_TCP_RST_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+
+    else if (e->reason == EVENT_ICMP_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_ICMP_ATTACK_PROTECION_MODE_START\n");
+    } else if (e->reason == EVENT_ICMP_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_ICMP_ATTACK_PROTECION_MODE_END\n");
+    } else if (e->reason == EVENT_ICMP_ATTACK_BURST_BLOCK) {
+        printf("EVENT_ICMP_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (e->reason == EVENT_ICMP_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_ICMP_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+
+    else if (e->reason == EVENT_UDP_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_UDP_ATTACK_PROTECION_MODE_START\n");
+    } else if (e->reason == EVENT_UDP_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_UDP_ATTACK_PROTECION_MODE_END\n");
+    } else if (e->reason == EVENT_UDP_ATTACK_BURST_BLOCK) {
+        printf("EVENT_UDP_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (e->reason == EVENT_UDP_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_UDP_ATTACK_FIXED_BLOCK %s\n", src);
+    }
+
+    else if (e->reason == EVENT_GRE_ATTACK_PROTECION_MODE_START) {
+        printf("EVENT_GRE_ATTACK_PROTECION_MODE_START\n");
+    } else if (e->reason == EVENT_GRE_ATTACK_PROTECION_MODE_END) {
+        printf("EVENT_GRE_ATTACK_PROTECION_MODE_END\n");
+    } else if (e->reason == EVENT_GRE_ATTACK_BURST_BLOCK) {
+        printf("EVENT_GRE_ATTACK_BURST_BLOCK %s\n", src);
+    } else if (e->reason == EVENT_GRE_ATTACK_FIXED_BLOCK) {
+        printf("EVENT_GRE_ATTACK_FIXED_BLOCK %s\n", src);
     }
 }
 
@@ -209,7 +252,10 @@ static int load_config(struct bpf_object *obj) {
     // Set default values
     struct global_config gcfg = {0};
     strncpy(ifname, "eth0", IFNAMSIZ);
-    attach_mode = XDP_FLAGS_SKB_MODE;
+    ifname[IFNAMSIZ-1] = '\0';
+
+    attach_mode = XDP_FLAGS_DRV_MODE;
+    tz_offset_sec = get_timezone_offset();
     gcfg.black_ip_duration = BLOCK_DURATION_NS;
 
     // Initialize SYN config with defaults
@@ -254,17 +300,25 @@ static int load_config(struct bpf_object *obj) {
         .udp_fixed_check_duration = UDP_FIXED_CHECK_DURATION_NS,
     };
 
+    struct gre_config gre_cfg = {
+        .gre_threshold = GRE_THRESHOLD,
+        .burst_pkt_threshold = GRE_BURST_PKT_THRESHOLD,
+        .burst_count_threshold = GRE_BURST_COUNT_THRESHOLD,
+        .gre_fixed_threshold = GRE_FIXED_THRESHOLD,
+        .gre_fixed_check_duration = GRE_FIXED_CHECK_DURATION_NS,
+    };
+
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), fp)) {
         // Skip comments and empty lines
         if (line[0] == '#' || line[0] == '\n') continue;
 
-        char key[32] = {0};
+        char key[128] = {0};
         char str_value[IFNAMSIZ] = {0};
         int int_value;
         
         // Try to parse as key=string first (for device name)
-        if (sscanf(line, "%31[^=]= %15s", key, str_value) == 2) {
+        if (sscanf(line, "%15[^=]= %31s", key, str_value) == 2) {
             trim_whitespace(key);
             trim_whitespace(str_value);
             
@@ -284,7 +338,7 @@ static int load_config(struct bpf_object *obj) {
                     attach_mode = XDP_FLAGS_SKB_MODE;
                 else if (strcmp(str_value, "native") == 0)
                     attach_mode = 0;
-                else if (strcmp(str_value, "drive") == 0)
+                else if (strcmp(str_value, "drv") == 0)
                     attach_mode = XDP_FLAGS_DRV_MODE;
                 else if (strcmp(str_value, "hw") == 0)
                     attach_mode = XDP_FLAGS_HW_MODE;
@@ -297,7 +351,7 @@ static int load_config(struct bpf_object *obj) {
         }
 
         // Try to parse as key=integer
-        if (sscanf(line, "%31[^=]= %d", key, &int_value) == 2) {
+        if (sscanf(line, "%127[^=]= %d", key, &int_value) == 2) {
             trim_whitespace(key);
             
             printf("Loaded config: %s = %d\n", key, int_value);
@@ -348,13 +402,13 @@ static int load_config(struct bpf_object *obj) {
             else if (strcmp(key, "icmp_threshold") == 0) {
                 icmp_cfg.icmp_threshold = int_value;
             } else if (strcmp(key, "icmp_burst_pkt") == 0) {
-                rst_cfg.burst_pkt_threshold = int_value;
+                icmp_cfg.burst_pkt_threshold = int_value;
             } else if (strcmp(key, "icmp_burst_count_per_sec") == 0) {
-                rst_cfg.burst_count_threshold = int_value;
+                icmp_cfg.burst_count_threshold = int_value;
             } else if (strcmp(key, "icmp_fixed_threshold") == 0) {
-                rst_cfg.rst_fixed_threshold = int_value;
+                icmp_cfg.icmp_fixed_threshold = int_value;
             } else if (strcmp(key, "icmp_fixed_check_duration") == 0) {
-                rst_cfg.rst_fixed_check_duration = int_value * ONE_SECOND_NS;
+                icmp_cfg.icmp_fixed_check_duration = int_value * ONE_SECOND_NS;
             } 
             //UDP config
             else if (strcmp(key, "udp_threshold") == 0) {
@@ -368,6 +422,18 @@ static int load_config(struct bpf_object *obj) {
             } else if (strcmp(key, "udp_fixed_check_duration") == 0) {
                 udp_cfg.udp_fixed_check_duration = int_value * ONE_SECOND_NS;
             } 
+            //GRE config
+            else if (strcmp(key, "gre_threshold") == 0) {
+                gre_cfg.gre_threshold = int_value;
+            } else if (strcmp(key, "gre_burst_pkt") == 0) {
+                gre_cfg.burst_pkt_threshold = int_value;
+            } else if (strcmp(key, "gre_burst_count_per_sec") == 0) {
+                gre_cfg.burst_count_threshold = int_value;
+            } else if (strcmp(key, "gre_fixed_threshold") == 0) {
+                gre_cfg.gre_fixed_threshold = int_value;
+            } else if (strcmp(key, "gre_fixed_check_duration") == 0) {
+                gre_cfg.gre_fixed_check_duration = int_value * ONE_SECOND_NS;
+            }
             else {
                 fprintf(stderr,"Unkown %s directive\n", key);
                 return -1;
@@ -375,11 +441,39 @@ static int load_config(struct bpf_object *obj) {
         }
     }
     fclose(fp);
+    
+    if (syn_cfg.burst_count_threshold == 0) {
+        fprintf(stderr,"Burst threshold of SYN is zero. Please reconfig it\n");
+        return -1;
+    }
+    if (ack_cfg.burst_count_threshold == 0) {
+        fprintf(stderr,"Burst threshold of ACK is zero. Please reconfig it\n");
+        return -1;
+    }
+    if (rst_cfg.burst_count_threshold == 0) {
+        fprintf(stderr,"Burst threshold of RST is zero. Please reconfig it\n");
+        return -1;
+    }
+    if (icmp_cfg.burst_count_threshold == 0) {
+        fprintf(stderr,"Burst threshold of ICMP is zero. Please reconfig it\n");
+        return -1;
+    }
+    if (udp_cfg.burst_count_threshold == 0) {
+        fprintf(stderr,"Burst threshold of UDP is zero. Please reconfig it\n");
+        return -1;
+    }
+    if (gre_cfg.burst_count_threshold == 0) {
+        fprintf(stderr,"Burst threshold of GRE is zero. Please reconfig it\n");
+        return -1;
+    }
 
     // Calculate burst gap
-    syn_cfg.burst_gap_ns = 1000000000ULL / (syn_cfg.burst_count_threshold);
-    ack_cfg.burst_gap_ns = 1000000000ULL / (ack_cfg.burst_count_threshold);
-    rst_cfg.burst_gap_ns = 1000000000ULL / (rst_cfg.burst_count_threshold);
+    syn_cfg.burst_gap_ns = ONE_SECOND_NS / (syn_cfg.burst_count_threshold);
+    ack_cfg.burst_gap_ns = ONE_SECOND_NS / (ack_cfg.burst_count_threshold);
+    rst_cfg.burst_gap_ns = ONE_SECOND_NS / (rst_cfg.burst_count_threshold);
+    icmp_cfg.burst_gap_ns = ONE_SECOND_NS / (icmp_cfg.burst_count_threshold);
+    udp_cfg.burst_gap_ns = ONE_SECOND_NS / (udp_cfg.burst_count_threshold);
+    gre_cfg.burst_gap_ns = ONE_SECOND_NS / (gre_cfg.burst_count_threshold);
 
     // Update SYN config map
     int syn_map_fd = bpf_object__find_map_fd_by_name(obj, "syn_config_map");
@@ -388,9 +482,59 @@ static int load_config(struct bpf_object *obj) {
         return -1;
     }
 
+    int ack_map_fd = bpf_object__find_map_fd_by_name(obj, "ack_config_map");
+    if (ack_map_fd < 0) {
+        fprintf(stderr, "Failed to find ack_config_map\n");
+        return -1;
+    }
+
+    int rst_map_fd = bpf_object__find_map_fd_by_name(obj, "rst_config_map");
+    if (rst_map_fd < 0) {
+        fprintf(stderr, "Failed to find rst_config_map\n");
+        return -1;
+    }
+
+    int icmp_map_fd = bpf_object__find_map_fd_by_name(obj, "icmp_config_map");
+    if (icmp_map_fd < 0) {
+        fprintf(stderr, "Failed to find icmp_config_map\n");
+        return -1;
+    }
+
+    int udp_map_fd = bpf_object__find_map_fd_by_name(obj, "udp_config_map");
+    if (udp_map_fd < 0) {
+        fprintf(stderr, "Failed to find udp_config_map\n");
+        return -1;
+    }
+
+    int gre_map_fd = bpf_object__find_map_fd_by_name(obj, "gre_config_map");
+    if (gre_map_fd < 0) {
+        fprintf(stderr, "Failed to find gre_config_map\n");
+        return -1;
+    }
+
     int key = 0;
     if (bpf_map_update_elem(syn_map_fd, &key, &syn_cfg, BPF_ANY)) {
         fprintf(stderr, "Failed to update syn_config_map\n");
+        return -1;
+    }
+    if (bpf_map_update_elem(ack_map_fd, &key, &ack_cfg, BPF_ANY)) {
+        fprintf(stderr, "Failed to update ack_config_map\n");
+        return -1;
+    }
+    if (bpf_map_update_elem(rst_map_fd, &key, &rst_cfg, BPF_ANY)) {
+        fprintf(stderr, "Failed to update rst_config_map\n");
+        return -1;
+    }
+    if (bpf_map_update_elem(icmp_map_fd, &key, &icmp_cfg, BPF_ANY)) {
+        fprintf(stderr, "Failed to update icmp_config_map\n");
+        return -1;
+    }
+    if (bpf_map_update_elem(udp_map_fd, &key, &udp_cfg, BPF_ANY)) {
+        fprintf(stderr, "Failed to update udp_config_map\n");
+        return -1;
+    }
+    if (bpf_map_update_elem(gre_map_fd, &key, &gre_cfg, BPF_ANY)) {
+        fprintf(stderr, "Failed to update gre_config_map\n");
         return -1;
     }
 
@@ -416,9 +560,10 @@ int main(int argc, char **argv) {
     
     int ifindex, err;
     struct bpf_object *obj;
-    struct bpf_program *prog_main, *prog_parse_syn, *prog_parse_ack, *prog_parse_rst, *prog_parse_icmp, *prog_parse_udp;
-    int attach_id = -1, prog_main_fd, prog_parse_syn_fd, prog_parse_ack_fd, prog_parse_rst_fd, prog_parse_icmp_fd, prog_parse_udp_fd;
+    struct bpf_program *prog_main, *prog_parse_syn, *prog_parse_ack, *prog_parse_rst, *prog_parse_icmp, *prog_parse_udp, *prog_parse_gre;
+    int attach_id = -1, prog_main_fd, prog_parse_syn_fd, prog_parse_ack_fd, prog_parse_rst_fd, prog_parse_icmp_fd, prog_parse_udp_fd, prog_parse_gre_fd;
     int prog_array_map_fd;
+    int tcp_established_map_fd;
     struct perf_buffer *pb = NULL;
     
     // Open the BPF object file (compiled from xdp_prog.c).
@@ -453,8 +598,9 @@ int main(int argc, char **argv) {
     prog_parse_rst = bpf_object__find_program_by_name(obj, "xdp_parse_rst");
     prog_parse_icmp = bpf_object__find_program_by_name(obj, "xdp_parse_icmp");
     prog_parse_udp = bpf_object__find_program_by_name(obj, "xdp_parse_udp");
+    prog_parse_gre = bpf_object__find_program_by_name(obj, "xdp_parse_gre");
 
-    if (!prog_main || !prog_parse_syn || !prog_parse_ack || !prog_parse_rst || !prog_parse_icmp || !prog_parse_udp) {
+    if (!prog_main || !prog_parse_syn || !prog_parse_ack || !prog_parse_rst || !prog_parse_icmp || !prog_parse_udp || !prog_parse_gre) {
         fprintf(stderr, "ERROR: could not find all program sections\n");
         goto cleanup;
     }
@@ -466,6 +612,7 @@ int main(int argc, char **argv) {
     prog_parse_rst_fd = bpf_program__fd(prog_parse_rst);
     prog_parse_icmp_fd = bpf_program__fd(prog_parse_icmp);
     prog_parse_udp_fd = bpf_program__fd(prog_parse_udp);
+    prog_parse_gre_fd = bpf_program__fd(prog_parse_gre);
     
     // Find the prog_array map (declared as "prog_array" in our BPF program).
     struct bpf_map *map = bpf_object__find_map_by_name(obj, "prog_array");
@@ -477,8 +624,8 @@ int main(int argc, char **argv) {
     
     // Update the prog_array map:
     // Key 0 -> xdp_parse_syn; Key 1 -> xdp_parse_ack.
-    // Key 2 -> xdp_parse_rst; Key 3 -> xdp_parse_icmp. Key 4 -> xdp_parse_udp.
-    int key0 = 0, key1 = 1, key2 = 2, key3 = 3, key4 = 4;
+    // Key 2 -> xdp_parse_rst; Key 3 -> xdp_parse_icmp. Key 4 -> xdp_parse_udp. Key 5 -> xdp_parse_gre.
+    int key0 = 0, key1 = 1, key2 = 2, key3 = 3, key4 = 4, key5 = 5;
     err = bpf_map_update_elem(prog_array_map_fd, &key0, &prog_parse_syn_fd, 0);
     if (err) {
         fprintf(stderr, "ERROR: updating prog_array key 0 failed: %d\n", err);
@@ -504,11 +651,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR: updating prog_array key 4 failed: %d\n", err);
         goto cleanup;
     }
+    err = bpf_map_update_elem(prog_array_map_fd, &key5, &prog_parse_gre_fd, 0);
+    if (err) {
+        fprintf(stderr, "ERROR: updating prog_array key 5 failed: %d\n", err);
+        goto cleanup;
+    }
     
     // Attach the main XDP program to the interface.
     attach_id = bpf_xdp_attach(ifindex, prog_main_fd, attach_mode, NULL);
     if (attach_id < 0) {
-        fprintf(stderr, "ERROR: attaching XDP program to %s (ifindex %d) failed: %d\n", ifname, ifindex, err);
+        fprintf(stderr, "ERROR: attaching XDP program to %s (ifindex %d) return %d, failed: %d\n", ifname, ifindex, attach_id, err);
         goto cleanup;
     }
     
@@ -526,20 +678,43 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    printf("XDP program successfully attached to interface %s (ifindex %d)\n", ifname, ifindex);
-    printf("Press Ctrl+C to exit and detach the program.\n");
-    
+    signal(SIGINT, sig_handler);
 
-    struct nfct_handle *cth;
-
-    // Set up conntrack handler
-    cth = nfct_open(CONNTRACK, NF_NETLINK_CONNTRACK_NEW | NF_NETLINK_CONNTRACK_UPDATE);
-    if (!cth) {
-        fprintf(stderr, "nfct_open");
+    // Get the map file descriptor
+    tcp_established_map_fd = bpf_object__find_map_fd_by_name(obj, "tcp_established_map");
+    if (tcp_established_map_fd < 0) {
+        fprintf(stderr, "Failed to find tcp_established_map eBPF map\n");
         goto cleanup;
     }
 
-    nfct_callback_register(cth, NFCT_T_ALL, event_cb, &map_fd);
+    struct nfct_handle *cth;
+    static const int family = AF_INET;
+
+    // Set up conntrack handler
+    cth = nfct_open(CONNTRACK, 0);
+    if (!cth) {
+        perror("nfct_open");
+        goto cleanup;
+    }
+
+    nfct_callback_register(cth, NFCT_T_ALL, event_cb, &tcp_established_map_fd);
+    printf("Established connections:\n");
+    nfct_query(cth, NFCT_Q_DUMP, &family);
+    nfct_close(cth);
+
+    cth = nfct_open(CONNTRACK, NFCT_ALL_CT_GROUPS);
+    if (!cth) {
+        perror("nfct_open");
+        goto cleanup;
+    }
+
+    nfct_callback_register(cth, NFCT_T_ALL, event_cb, &tcp_established_map_fd);
+
+    pthread_t ct_thr; 
+    pthread_create(&ct_thr, NULL, (void *(*)(void *))nfct_catch, cth);
+
+    printf("XDP program successfully attached to interface %s (ifindex %d)\n", ifname, ifindex);
+    printf("Press Ctrl+C to exit and detach the program.\n");
 
     // Wait until terminated.
     while (!exiting) {
@@ -555,11 +730,13 @@ cleanup:
         nfct_close(cth);
     if (pb)
         perf_buffer__free(pb);
-    // Detach the XDP program before exit.
-    if (attach_id > 0)
-        bpf_xdp_detach(ifindex, attach_mode, NULL);
     if (obj)
         bpf_object__close(obj);
     
+    if (attach_id >= 0)
+        bpf_xdp_detach(ifindex, attach_mode, NULL);
+    
+    printf("Program is ended\n");
+
     return err < 0 ? -err : 0;
 }

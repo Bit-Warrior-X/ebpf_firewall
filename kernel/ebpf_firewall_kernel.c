@@ -41,13 +41,6 @@ struct {
 } blocked_ips SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(max_entries, 25);
-    __type(key, __u32);      // CPU index
-    __type(value, int);      // Must be int (FD)
-} events SEC(".maps");
-
-struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);     /* 256KB buffer */
 } ring_buf_events SEC(".maps");

@@ -5,11 +5,12 @@
 
 // Define time constants (in nanoseconds)
 
-#define MAX_LINE_LEN            128
-#define CONFIG_FILE             "firewall.config"
+#define MAX_LINE_LEN                128
+#define CONFIG_FILE                 "firewall.config"
+#define SOCK_PATH                   "/tmp/ebpf_fw.sock"
 
-#define ONE_SECOND_NS           1000000000ULL
-#define BLOCK_DURATION_NS       (3600ULL * 1000000000ULL)  // 1 hour
+#define ONE_SECOND_NS               1000000000ULL
+#define BLOCK_DURATION_NS           (3600ULL * 1000000000ULL)  // 1 hour
 
 #define SYN_THRESHOLD               200000                    // 200K SYN packets per second
 #define SYN_BURST_PKT_THRESHOLD     20                        /* Each burst must have >=20 SYN packets */
@@ -209,7 +210,6 @@ struct tcp_session {
     __u32 dst_ip;    // in network byte order
     __u16 dst_port;  // in network byte order
 } __attribute__((packed));
-
 
 
 #endif

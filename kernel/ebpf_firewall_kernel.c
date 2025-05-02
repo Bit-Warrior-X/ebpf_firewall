@@ -250,8 +250,7 @@ int xdp_parse_syn(struct xdp_md *ctx) {
 
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
-    __u32 dst_ip = ip->daddr;
-    
+    //__u32 dst_ip = ip->daddr;
     //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
 
     // Get current threshold from map
@@ -531,8 +530,7 @@ int xdp_parse_ack(struct xdp_md *ctx) {
 
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
-    __u32 dst_ip = ip->daddr;
-    
+    //__u32 dst_ip = ip->daddr;
     //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source));
 
     // Get current threshold from map
@@ -754,8 +752,7 @@ int xdp_parse_rst(struct xdp_md *ctx) {
 
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
-    __u32 dst_ip = ip->daddr;
-    
+    //__u32 dst_ip = ip->daddr;
     //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
 
     // Get current threshold from map
@@ -969,8 +966,7 @@ int xdp_parse_icmp(struct xdp_md *ctx) {
     
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
-    __u32 dst_ip = ip->daddr;
-    
+    //__u32 dst_ip = ip->daddr;
     //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
 
     // Get current threshold from map
@@ -1185,8 +1181,7 @@ int xdp_parse_udp(struct xdp_md *ctx) {
     
     // Get the source IP address.
     __u32 src_ip = ip->saddr;
-    __u32 dst_ip = ip->daddr;
-    
+    //__u32 dst_ip = ip->daddr;
     //bpf_printk("%pI4:%d -----> %pI4:%d\n", &src_ip, bpf_htons(tcp->source), &dst_ip, bpf_htons(tcp->dest));
 
     // Get current threshold from map

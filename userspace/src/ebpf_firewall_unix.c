@@ -124,7 +124,7 @@ static void * unix_socket_worker(void * arg)
         }
         close(cfd);
     }
-    
+
     return NULL;
 }
 
@@ -146,6 +146,12 @@ int init_unix_socket() {
 
     if (listen(srv_fd, 8) == -1) {
         fatal("listen");
+        return -1;
+    }
+
+    pthread_t unix_socket_worker_thr;
+    if (pthread_create(&unix_socket_worker_thr, NULL, unix_socket_worker, NULL) != 0) {
+        perror("pthread_create for unix_socket_worker_thr");
         return -1;
     }
 

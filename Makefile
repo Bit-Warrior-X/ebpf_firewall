@@ -22,7 +22,10 @@ USR_SRCS     := userspace/src/ebpf_firewall_unix.c \
                 userspace/src/ebpf_firewall_core.c \
                 userspace/src/ebpf_firewall_config.c
 
+USR_CLI      := userspace/src/ebpf_firewall_cli.c
+
 USR_BIN      := $(BUILD_DIR)/ebpf_firewall_userspace
+USR_CLIBIN   := $(BUILD_DIR)/ebpf_firewall_cli
 USR_INC_DIR  := userspace/include
 
 # Libraries
@@ -32,7 +35,7 @@ USR_LIBS     := -lbpf -lxdp -lnetfilter_conntrack -lpthread
 # ──────────────── Targets ────────────────
 .PHONY: all unload run clean
 
-all: $(BUILD_DIR) unload $(KERNEL_OBJ) $(USR_BIN)
+all: $(BUILD_DIR) unload $(KERNEL_OBJ) $(USR_BIN) $(USR_CLIBIN)
 
 # 1. Build directory
 $(BUILD_DIR):
@@ -49,10 +52,12 @@ $(USR_BIN): $(USR_SRCS) | $(BUILD_DIR)
 	@echo ">> Linking userspace firewall"
 	$(GCC) -o $@ $^ -I$(USR_INC_DIR) $(USR_LIBS) -I.
 
-
+$(USR_CLIBIN): $(USR_CLI) | $(BUILD_DIR)
+	@echo ">> Linking userspace cli firewall"
+	$(GCC) -o $@ $^ 
 
 run: all
-	@$(USR_BIN)
+	@cd $(BUILD_DIR) && ./ebpf_firewall_userspace
 
 clean:
 	@rm -rf $(BUILD_DIR)

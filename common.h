@@ -6,6 +6,7 @@
 // Define time constants (in nanoseconds)
 
 #define MAX_LINE_LEN                128
+#define XDP_CORE_FILE               "ebpf_firewall_kernel.o"
 #define CONFIG_FILE                 "firewall.config"
 #define SOCK_PATH                   "/tmp/ebpf_fw.sock"
 

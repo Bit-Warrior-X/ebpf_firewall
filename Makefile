@@ -34,27 +34,22 @@ USR_LIBS     := -lbpf -lxdp -lnetfilter_conntrack -lpthread
 
 all: $(BUILD_DIR) unload $(KERNEL_OBJ) $(USR_BIN)
 
-# 1. Optional helper to unload any previous XDP program
-#unload:
-#	@echo ">> Unloading XDP program from ens38"
-#	@command -v xdp-loader >/dev/null 2>&1 || { \
-#		echo "xdp-loader command not found!" >&2; exit 1; }
-#	@xdp-loader unload -a ens38 || true
-
-
-# 2. Build directory
+# 1. Build directory
 $(BUILD_DIR):
 	@mkdir -p $@
+	cp firewall.config build/
 
-# 3. Compile eBPF object
+# 2. Compile eBPF object
 $(KERNEL_OBJ): $(KERNEL_SRC) | $(BUILD_DIR)
 	@echo ">> Compiling eBPF kernel object"
 	$(CLANG)  -I. $(CLANG_FLAGS) -c $< -o $@
 
-# 4. Compile userspace binary
+# 3. Compile userspace binary
 $(USR_BIN): $(USR_SRCS) | $(BUILD_DIR)
 	@echo ">> Linking userspace firewall"
 	$(GCC) -o $@ $^ -I$(USR_INC_DIR) $(USR_LIBS) -I.
+
+
 
 run: all
 	@$(USR_BIN)

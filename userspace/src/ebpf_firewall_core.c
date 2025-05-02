@@ -350,7 +350,7 @@ int main(int argc, char **argv) {
     struct ring_buffer *ringbuf = NULL;
     
     // Open the BPF object file (compiled from xdp_prog.c).
-    obj = bpf_object__open_file("xdp_prog.o", NULL);
+    obj = bpf_object__open_file(XDP_CORE_FILE, NULL);
     if (!obj) {
         fprintf(stderr, "ERROR: opening BPF object file failed\n");
         return 1;

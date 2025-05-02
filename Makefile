@@ -54,7 +54,7 @@ $(KERNEL_OBJ): $(KERNEL_SRC) | $(BUILD_DIR)
 # 4. Compile userspace binary
 $(USR_BIN): $(USR_SRCS) | $(BUILD_DIR)
 	@echo ">> Linking userspace firewall"
-	$(GCC) -o $@ $^ -I$(USR_INC_DIR) $(USR_LIBS)
+	$(GCC) -o $@ $^ -I$(USR_INC_DIR) $(USR_LIBS) -I.
 
 run: all
 	@$(USR_BIN)

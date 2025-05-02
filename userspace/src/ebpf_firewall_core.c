@@ -1,5 +1,8 @@
 #include <ebpf_firewall_common.h>
 #include <ebpf_firewall_log.h>
+#include <ebpf_firewall_unix.h>
+#include <ebpf_firewall_config.h>
+
 
 extern char ifname[IFNAMSIZ];       // Network interface name
 extern __u32 attach_mode;           // Attach mode of ebpf
@@ -12,6 +15,14 @@ static void sig_handler(int signo)
 {
     exiting = 1;
 }
+
+extern struct global_config gcfg;
+extern struct syn_config syn_cfg;
+extern struct ack_config ack_cfg;
+extern struct rst_config rst_cfg;
+extern struct icmp_config icmp_cfg;
+extern struct udp_config udp_cfg;
+extern struct gre_config gre_cfg;
 
 static void * global_attack_check_worker(void * arg) {
 

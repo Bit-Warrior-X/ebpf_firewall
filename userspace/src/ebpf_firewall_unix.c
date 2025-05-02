@@ -124,9 +124,7 @@ static void * unix_socket_worker(void * arg)
         }
         close(cfd);
     }
-
-    cleanup();
-
+    
     return NULL;
 }
 

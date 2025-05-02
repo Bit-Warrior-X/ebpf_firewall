@@ -951,7 +951,7 @@ int xdp_parse_icmp(struct xdp_md *ctx) {
     int ihl = ip->ihl * 4;
     if ((void *)ip + ihl + sizeof(struct icmphdr) > data_end)
         return XDP_PASS;
-    struct icmphdr *icmp = (void *)ip + ihl;
+    //struct icmphdr *icmp = (void *)ip + ihl;
 
     __u32 key = 0;
 
@@ -1166,7 +1166,7 @@ int xdp_parse_udp(struct xdp_md *ctx) {
     int ihl = ip->ihl * 4;
     if ((void *)ip + ihl + sizeof(struct udphdr) > data_end)
         return XDP_PASS;
-    struct udphdr *udp = (void *)ip + ihl;
+    //struct udphdr *udp = (void *)ip + ihl;
     
     __u32 key = 0;
 

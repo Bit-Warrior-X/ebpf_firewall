@@ -258,7 +258,7 @@ void print_firewall_status(struct tm * tm_info, int reason, __u32 srcip) {
 }
 
 // Callback function invoked for each perf event.
-static void handle_event(void *ctx, int cpu, void *data, __u32 size)
+static int handle_event(void *ctx, void *data, size_t size)
 {
     struct event *e = data;
     /* Convert monotonic time to real time by adding the offset */
@@ -270,10 +270,11 @@ static void handle_event(void *ctx, int cpu, void *data, __u32 size)
     struct tm tm_info;
     if (localtime_r(&seconds, &tm_info) == NULL) {
         fprintf(stderr, "localtime_r error\n");
-        return;
+        return -1;
     }
 
     print_firewall_status(&tm_info, e->reason, e->srcip);
+    return 0;
 }
 
 /* Lost events callback (optional) */
@@ -814,6 +815,7 @@ int main(int argc, char **argv) {
     int prog_array_map_fd;
     int tcp_established_map_fd;
     struct perf_buffer *pb = NULL;
+    struct ring_buffer *ringbuf = NULL;
     
     // Open the BPF object file (compiled from xdp_prog.c).
     obj = bpf_object__open_file("xdp_prog.o", NULL);
@@ -912,20 +914,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR: attaching XDP program to %s (ifindex %d) return %d, failed: %d\n", ifname, ifindex, attach_id, err);
         goto cleanup;
     }
+
+    //Open Ringbuf map
+    int ring_buf_events_map_fd = bpf_object__find_map_fd_by_name(obj, "ring_buf_events");
+    if (ring_buf_events_map_fd < 0) {
+        fprintf(stderr, "ERROR: finding map 'ring_buf_events'\n");
+        goto cleanup;
+    }
     
-    // Open the perf event array map.
-    int map_fd = bpf_object__find_map_fd_by_name(obj, "events");
-    if (map_fd < 0) {
-        fprintf(stderr, "ERROR: finding map 'events'\n");
+    // Set up ring buffer
+    ringbuf = ring_buffer__new(ring_buf_events_map_fd, handle_event, NULL, NULL);
+    if (!ringbuf) {
+        fprintf(stderr, "Failed to create ring buffer\n");
+        err = -1;
         goto cleanup;
     }
-    pb = perf_buffer__new(map_fd, 8, handle_event, NULL, NULL, NULL);
-    if (libbpf_get_error(pb)) {
-        err = libbpf_get_error(pb);
-        fprintf(stderr, "ERROR: opening perf buffer: %d\n", err);
-        pb = NULL;
-        goto cleanup;
-    }
+
+
 
     signal(SIGINT, sig_handler);
 
@@ -976,23 +981,22 @@ int main(int argc, char **argv) {
 
     // Wait until terminated.
     while (!exiting) {
-        err = perf_buffer__poll(pb, 100);
-        if (err < 0 && err != -EINTR) {
-            fprintf(stderr, "ERROR: perf_buffer__poll: %d\n", err);
+        err = ring_buffer__poll(ringbuf, 100 /* timeout, ms */);
+        if (err == -EINTR) {
+            err = 0;
+            break;
+        }
+        if (err < 0) {
+            fprintf(stderr, "Error polling ring buffer: %d\n", err);
             break;
         }
     }
     
 cleanup:
-    if (cth)
-        nfct_close(cth);
-    if (pb)
-        perf_buffer__free(pb);
-    if (obj)
-        bpf_object__close(obj);
-    
-    if (attach_id >= 0)
-        bpf_xdp_detach(ifindex, attach_mode, NULL);
+    if (cth) nfct_close(cth);
+    if (ringbuf) ring_buffer__free(ringbuf);
+    if (obj) bpf_object__close(obj);
+    if (attach_id >= 0) bpf_xdp_detach(ifindex, attach_mode, NULL);
     
     printf("Program is ended\n");
 

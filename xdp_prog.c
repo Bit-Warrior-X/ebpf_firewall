@@ -48,6 +48,11 @@ struct {
 } events SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);     /* 256KB buffer */
+} ring_buf_events SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10000);
     __type(key, __u64);   // Source IP address + Port.
@@ -117,7 +122,7 @@ int xdp_main(struct xdp_md *ctx) {
             evt.time = now;
             evt.srcip = src_ip;
             evt.reason = EVENT_IP_BLOCK_END;
-            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
 
             bpf_map_delete_elem(&blocked_ips, &src_ip);
         }
@@ -326,7 +331,7 @@ int xdp_parse_syn(struct xdp_md *ctx) {
             evt.srcip = src_ip;
             evt.reason = EVENT_TCP_SYN_ATTACK_BURST_BLOCK;
             // Send the event to user space on the current CPU.
-            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
 
             return XDP_DROP;
         }
@@ -453,7 +458,7 @@ int xdp_parse_syn(struct xdp_md *ctx) {
         evt.srcip = src_ip;
         evt.reason = EVENT_TCP_SYN_ATTACK_FIXED_BLOCK;
         // Send the event to user space on the current CPU.
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
         
         return XDP_DROP;
     }
@@ -610,7 +615,7 @@ int xdp_parse_ack(struct xdp_md *ctx) {
                 evt.srcip = src_ip;
                 evt.reason = EVENT_TCP_ACK_ATTACK_BURST_BLOCK;
                 // Send the event to user space on the current CPU.
-                bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+                bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
 
                 return XDP_DROP;
             }
@@ -676,7 +681,7 @@ int xdp_parse_ack(struct xdp_md *ctx) {
         evt.srcip = src_ip;
         evt.reason = EVENT_TCP_ACK_ATTACK_FIXED_BLOCK;
         // Send the event to user space on the current CPU.
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
         
         return XDP_DROP;
     }
@@ -827,7 +832,7 @@ int xdp_parse_rst(struct xdp_md *ctx) {
             evt.srcip = src_ip;
             evt.reason = EVENT_TCP_RST_ATTACK_BURST_BLOCK;
             // Send the event to user space on the current CPU.
-            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
 
             return XDP_DROP;
         }
@@ -892,7 +897,7 @@ int xdp_parse_rst(struct xdp_md *ctx) {
         evt.srcip = src_ip;
         evt.reason = EVENT_TCP_RST_ATTACK_FIXED_BLOCK;
         // Send the event to user space on the current CPU.
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
         
         return XDP_DROP;
     }
@@ -1042,7 +1047,7 @@ int xdp_parse_icmp(struct xdp_md *ctx) {
             evt.srcip = src_ip;
             evt.reason = EVENT_ICMP_ATTACK_BURST_BLOCK;
             // Send the event to user space on the current CPU.
-            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
 
             return XDP_DROP;
         }
@@ -1107,7 +1112,7 @@ int xdp_parse_icmp(struct xdp_md *ctx) {
         evt.srcip = src_ip;
         evt.reason = EVENT_ICMP_ATTACK_FIXED_BLOCK;
         // Send the event to user space on the current CPU.
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
         
         return XDP_DROP;
     }
@@ -1258,7 +1263,7 @@ int xdp_parse_udp(struct xdp_md *ctx) {
             evt.srcip = src_ip;
             evt.reason = EVENT_UDP_ATTACK_BURST_BLOCK;
             // Send the event to user space on the current CPU.
-            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
 
             return XDP_DROP;
         }
@@ -1323,7 +1328,7 @@ int xdp_parse_udp(struct xdp_md *ctx) {
         evt.srcip = src_ip;
         evt.reason = EVENT_UDP_ATTACK_FIXED_BLOCK;
         // Send the event to user space on the current CPU.
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
         
         return XDP_DROP;
     }
@@ -1457,7 +1462,7 @@ int xdp_parse_gre(struct xdp_md *ctx) {
             evt.srcip = src_ip;
             evt.reason = EVENT_GRE_ATTACK_BURST_BLOCK;
             // Send the event to user space on the current CPU.
-            bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+            bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
 
             return XDP_DROP;
         }
@@ -1522,7 +1527,7 @@ int xdp_parse_gre(struct xdp_md *ctx) {
         evt.srcip = src_ip;
         evt.reason = EVENT_GRE_ATTACK_FIXED_BLOCK;
         // Send the event to user space on the current CPU.
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+        bpf_ringbuf_output(&ring_buf_events, &evt, sizeof(evt), 0);
         
         return XDP_DROP;
     }

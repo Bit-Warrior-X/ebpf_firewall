@@ -14,12 +14,6 @@
 
 static int srv_fd = -1;
 extern int exiting;
-/* ---------- helpers ----------------------------------------------------- */
-
-static void fatal(const char *msg) {
-    perror(msg);
-    exit(EXIT_FAILURE);
-}
 
 static void reply(int cfd, const char *fmt, ...) {
     char buf[BUF_SZ];
@@ -34,14 +28,15 @@ static void reply(int cfd, const char *fmt, ...) {
 /* ---------- stub command handlers -------------------------------------- */
 
 static void handle_restart_fw(int cfd, char **argv, int argc) {
-    (void)argv; (void)argc;
-    // TODO: real implementation
+    //(void)argv; (void)argc;
+    restart_fw();
     reply(cfd, "OK FW restarted\n");
 }
 
 static void handle_clear_fw(int cfd, char **argv, int argc) {
     (void)argv; (void)argc;
     // TODO
+    
     reply(cfd, "OK stats cleared\n");
 }
 
@@ -140,12 +135,12 @@ int init_unix_socket() {
     }
 
     if (bind(srv_fd, (struct sockaddr *)&addr, sizeof addr) == -1) {
-        fatal("bind");
+        perror("bind");
         return -1;
     }
 
     if (listen(srv_fd, 8) == -1) {
-        fatal("listen");
+        perror("listen");
         return -1;
     }
 

@@ -11,6 +11,8 @@ extern __u64 time_offset_ns;        // Timeo offset ns
 extern long tz_offset_sec;          // Timezone offset
 
 int exiting = 0;
+char process_name[1024];
+
 static void sig_handler(int signo)
 {
     exiting = 1;
@@ -377,6 +379,8 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
+    snprintf(process_name, 1024, "%s", argv[0]);
+
     // Get interface index.
     ifindex = if_nametoindex(ifname);
     if (!ifindex) {
@@ -543,4 +547,9 @@ cleanup:
     printf("Program is ended\n");
 
     return err < 0 ? -err : 0;
+}
+
+
+void restart_fw() {
+    execvp(process_name, NULL);
 }

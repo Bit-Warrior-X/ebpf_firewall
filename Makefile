@@ -54,7 +54,7 @@ $(USR_BIN): $(USR_SRCS) | $(BUILD_DIR)
 
 $(USR_CLIBIN): $(USR_CLI) | $(BUILD_DIR)
 	@echo ">> Linking userspace cli firewall"
-	$(GCC) -o $@ $^ 
+	$(GCC) -o $@ $^
 
 run: all
 	@cd $(BUILD_DIR) && ./ebpf_firewall_userspace

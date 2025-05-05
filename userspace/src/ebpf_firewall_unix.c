@@ -6,9 +6,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#include <ebpf_firewall_unix.h>
 #include <ebpf_firewall_common.h>
-
+#include <ebpf_firewall_unix.h>
+#include <ebpf_firewall_core.h>
 
 #define BUF_SZ    1024
 
@@ -29,14 +29,19 @@ static void reply(int cfd, const char *fmt, ...) {
 
 static void handle_restart_fw(int cfd, char **argv, int argc) {
     //(void)argv; (void)argc;
-    restart_fw();
-    reply(cfd, "OK FW restarted\n");
+    int ret = -1;
+    ret = restart_fw();
+    if (ret == -1 ) {
+        reply(cfd, "Failed! FW restarted failed\n");
+    } else {
+        reply(cfd, "OK! FW restarted correctly\n");
+    }
 }
 
 static void handle_clear_fw(int cfd, char **argv, int argc) {
     (void)argv; (void)argc;
     // TODO
-    
+
     reply(cfd, "OK stats cleared\n");
 }
 

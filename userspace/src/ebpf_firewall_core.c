@@ -11,7 +11,7 @@ extern __u64 time_offset_ns;        // Timeo offset ns
 extern long tz_offset_sec;          // Timezone offset
 
 int exiting = 0;
-char process_name[1024];
+char **process_argv = NULL;
 
 static void sig_handler(int signo)
 {
@@ -379,7 +379,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    snprintf(process_name, 1024, "%s", argv[0]);
+    process_argv = argv;
 
     // Get interface index.
     ifindex = if_nametoindex(ifname);
@@ -550,6 +550,19 @@ cleanup:
 }
 
 
-void restart_fw() {
-    execvp(process_name, NULL);
+int restart_fw() {
+    int ret = -1;
+
+    if (process_argv == NULL) {
+        fprintf(stderr, "Process argument is NULL\n");
+        return -1;
+    }
+
+    ret = execvp(process_argv[0], process_argv);
+    if (ret == -1) {
+        fprintf(stderr, "Process did not terminate correctly\n");
+        return -1;
+    }
+
+    return ret;
 }

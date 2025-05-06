@@ -12,6 +12,7 @@ extern long tz_offset_sec;          // Timezone offset
 
 int exiting = 0;
 char **process_argv = NULL;
+struct bpf_object *obj;
 
 static void sig_handler(int signo)
 {
@@ -343,7 +344,6 @@ static int ringbuf_handle_event(void *ctx, void *data, size_t size)
 int main(int argc, char **argv) {
     
     int ifindex, err;
-    struct bpf_object *obj;
     struct bpf_program *prog_main, *prog_parse_syn, *prog_parse_ack, *prog_parse_rst, *prog_parse_icmp, *prog_parse_udp, *prog_parse_gre;
     int attach_id = -1, prog_main_fd, prog_parse_syn_fd, prog_parse_ack_fd, prog_parse_rst_fd, prog_parse_icmp_fd, prog_parse_udp_fd, prog_parse_gre_fd;
     int prog_array_map_fd;
@@ -565,4 +565,384 @@ int restart_fw() {
     }
 
     return ret;
+}
+
+#if 0
+/* -------------------------------------------------------------- */
+/* Core: count elements in map_fd, independent of key/value sizes */
+static long count_map(int map_fd)
+{
+    struct bpf_map_info info = {};
+    __u32 len = sizeof(info);
+    if (bpf_obj_get_info_by_fd(map_fd, &info, &len)) {
+        perror("bpf_obj_get_info_by_fd");
+        return -1;
+    }
+
+#if defined(BPF_MAP_LOOKUP_BATCH)   /* kernel ≥ 5.6 ---------------------- */
+    const __u32 BATCH = 256;
+    void *keys = malloc(BATCH * info.key_size);
+    void *vals = info.value_size ? malloc(BATCH * info.value_size) : NULL;
+    void *in_key = NULL, *out_key = malloc(info.key_size);
+    if (!keys || (!vals && info.value_size) || !out_key) {
+        fprintf(stderr, "OOM\n");
+        goto err_batch;
+    }
+
+    long total = 0;
+    for (;;) {
+        __u32 cnt = BATCH;
+        int err = bpf_map_lookup_batch(map_fd,
+                                       in_key, out_key,
+                                       keys, vals, &cnt, NULL);
+        if (err) {
+            if (errno == ENOENT)    /* map exhausted */
+                break;
+            perror("bpf_map_lookup_batch");
+            goto err_batch;
+        }
+        total += cnt;
+        if (cnt < BATCH)            /* short read → nothing left */
+            break;
+        in_key = out_key;           /* continue where we stopped */
+    }
+
+    free(keys); free(vals); free(out_key);
+    return total;
+
+err_batch:
+    free(keys); free(vals); free(out_key);
+    return -1;
+
+#else                               /* fallback: GET_NEXT_KEY loop ------- */
+    void *key = calloc(1, info.key_size);
+    void *next = calloc(1, info.key_size);
+    if (!key || !next) {
+        fprintf(stderr, "OOM\n");
+        free(key); free(next);
+        return -1;
+    }
+
+    long total = 0;
+    /* first call: NULL → first key */
+    if (bpf_map_get_next_key(map_fd, NULL, next))
+        goto done;                  /* map empty */
+
+    do {
+        ++total;
+        memcpy(key, next, info.key_size);
+    } while (!bpf_map_get_next_key(map_fd, key, next));
+
+done:
+    free(key); free(next);
+    return total;
+#endif
+}
+#endif
+
+static int clear_batch_map(int map_fd)
+{   
+    const __u32 BATCH_SZ = 256;
+    struct bpf_map_info info = {};
+    __u32 info_len = sizeof(info);
+    int err;
+
+    if (bpf_obj_get_info_by_fd(map_fd, &info, &info_len)) {
+        perror("bpf_obj_get_info_by_fd");
+        return -1;
+    }
+
+    /* --- allocate buffers ------------------------------------------------ */
+    void *keys   = calloc(BATCH_SZ, info.key_size);
+    void *values = info.value_size ? calloc(BATCH_SZ, info.value_size) : NULL;
+    void *next_key = malloc(info.key_size);          /* out_batch scratch */
+
+    if (!keys || (info.value_size && !values) || !next_key) {
+        fprintf(stderr, "clear_map: out of memory\n");
+        goto error;
+    }
+
+    /* --- iterate & delete ------------------------------------------------ */
+    void *in_key = NULL;            /* start from beginning */
+    __u32 total = 0;
+
+    for (;;) {
+        __u32 cnt = BATCH_SZ;
+
+        err = bpf_map_lookup_and_delete_batch(map_fd,
+                                              in_key,          /* in_batch  */
+                                              next_key,        /* out_batch */
+                                              keys,
+                                              values,
+                                              &cnt,
+                                              NULL);
+        if (err) {
+            if (errno == ENOENT)         /* map already empty */
+                break;
+            perror("bpf_map_lookup_and_delete_batch");
+            goto error;
+        }
+
+        if (cnt < BATCH_SZ)              /* short batch → nothing left */
+            break;
+
+        in_key = next_key;               /* continue from where we stopped */
+    }
+
+    free(keys); free(values); free(next_key);
+    return 0;
+
+error:
+    free(keys); free(values); free(next_key);
+    return -1;
+}
+
+static int clear_pkt_counter_map(int map_fd) {
+    __u32 key = 0;
+    __u64 *values = calloc(n_cpus, sizeof(__u64));
+
+    if (values == NULL)
+        goto error;
+
+    if (bpf_map_lookup_elem(map_fd, &key, values)) {
+        fprintf(stderr, "bpf_map_lookup_elem");
+        goto error;
+    }
+    for (int cpu = 0; cpu < n_cpus; cpu++) {
+        values[cpu] = 0;
+    }
+
+    bpf_map_update_elem(map_fd, &key, values, 0);
+    if (values) free (values);
+    return 0;
+error:
+    if (values) free (values);
+    return -1;
+}
+
+static int clear_global_attack_stats_map(int map_fd) {
+    __u32 key = 0;
+    struct global_attack_stats global_attack_stats_val;
+
+    if (bpf_map_lookup_elem(map_fd, &key, &global_attack_stats_val)) {
+        fprintf(stderr, "bpf_map_lookup_elem");
+        return -1;
+    }
+    memset(&global_attack_stats_val, 0 , sizeof (struct global_attack_stats));
+    bpf_map_update_elem(map_fd, &key, &global_attack_stats_val, 0);
+    return 0;
+}
+
+int clear_fw() {
+#if 0
+    int blocked_ips_fd;
+    blocked_ips_fd = bpf_object__find_map_fd_by_name(obj, "blocked_ips");
+    if (blocked_ips_fd < 0) {
+        fprintf(stderr, "Failed to find blocked_ips\n");
+        return -1;
+    }
+    printf("total registered count is %d\n", count_map(blocked_ips_fd));
+    if (clear_batch_map(blocked_ips_fd) < 0)
+        return -1;
+    printf("blocked_ips_fd is cleared\n");
+    printf("After clear total registered count is %d\n", count_map(blocked_ips_fd));
+#endif
+    int tcp_established_map_fd, global_attack_stats_map_fd;
+
+    tcp_established_map_fd = bpf_object__find_map_fd_by_name(obj, "tcp_established_map");
+    if (tcp_established_map_fd < 0) {
+        fprintf(stderr, "Failed to find tcp_established_map\n");
+        return -1;
+    }
+    if (clear_batch_map(tcp_established_map_fd) < 0)
+        return -1;
+    printf("tcp_established_map is cleared\n");
+    
+    global_attack_stats_map_fd = bpf_object__find_map_fd_by_name(obj, "global_attack_stats_map");
+    if (global_attack_stats_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_attack_stats_map\n");
+        return -1;
+    }
+    if (clear_global_attack_stats_map(global_attack_stats_map_fd) < 0)
+        return -1;
+    printf("global_attack_stats_map is cleared\n");
+
+    int global_syn_pkt_counter_fd, syn_counter_fixed_fd, burst_syn_state_fd, syn_challenge_fd;
+    global_syn_pkt_counter_fd = bpf_object__find_map_fd_by_name(obj, "global_syn_pkt_counter");
+    if (global_syn_pkt_counter_fd < 0) {
+        fprintf(stderr, "Failed to find global_syn_pkt_counter\n");
+        return -1;
+    }
+    if (clear_pkt_counter_map(global_syn_pkt_counter_fd) < 0)
+        return -1;
+    printf("global_syn_pkt_counter is cleared\n");  
+
+    syn_counter_fixed_fd = bpf_object__find_map_fd_by_name(obj, "syn_counter_fixed");
+    if (syn_counter_fixed_fd < 0) {
+        fprintf(stderr, "Failed to find syn_counter_fixed\n");
+        return -1;
+    }
+    if (clear_batch_map(syn_counter_fixed_fd) < 0)
+        return -1;
+    printf("syn_counter_fixed is cleared\n");  
+
+    burst_syn_state_fd = bpf_object__find_map_fd_by_name(obj, "burst_syn_state");
+    if (burst_syn_state_fd < 0) {
+        fprintf(stderr, "Failed to find burst_syn_state\n");
+        return -1;
+    }
+    if (clear_batch_map(burst_syn_state_fd) < 0)
+        return -1;
+    printf("burst_syn_state is cleared\n");  
+
+    syn_challenge_fd = bpf_object__find_map_fd_by_name(obj, "syn_challenge");
+    if (syn_challenge_fd < 0) {
+        fprintf(stderr, "Failed to find syn_challenge\n");
+        return -1;
+    }
+    if (clear_batch_map(syn_challenge_fd) < 0)
+        return -1;
+    printf("syn_challenge is cleared\n");  
+
+    int global_ack_pkt_counter_fd, ack_counter_fixed_fd, burst_ack_state_fd;
+    global_ack_pkt_counter_fd = bpf_object__find_map_fd_by_name(obj, "global_ack_pkt_counter");
+    if (global_ack_pkt_counter_fd < 0) {
+        fprintf(stderr, "Failed to find global_ack_pkt_counter\n");
+        return -1;
+    }
+    if (clear_pkt_counter_map(global_ack_pkt_counter_fd) < 0)
+        return -1;
+    printf("global_ack_pkt_counter is cleared\n");  
+
+    ack_counter_fixed_fd = bpf_object__find_map_fd_by_name(obj, "ack_counter_fixed");
+    if (ack_counter_fixed_fd < 0) {
+        fprintf(stderr, "Failed to find ack_counter_fixed\n");
+        return -1;
+    }
+    if (clear_batch_map(ack_counter_fixed_fd) < 0)
+        return -1;
+    printf("ack_counter_fixed is cleared\n"); 
+
+    burst_ack_state_fd = bpf_object__find_map_fd_by_name(obj, "burst_ack_state");
+    if (burst_ack_state_fd < 0) {
+        fprintf(stderr, "Failed to find burst_ack_state\n");
+        return -1;
+    }
+    if (clear_batch_map(burst_ack_state_fd) < 0)
+        return -1;
+    printf("burst_ack_state is cleared\n"); 
+
+    int global_rst_pkt_counter_fd, rst_counter_fixed_fd, burst_rst_state_fd;
+    global_rst_pkt_counter_fd = bpf_object__find_map_fd_by_name(obj, "global_rst_pkt_counter");
+    if (global_rst_pkt_counter_fd < 0) {
+        fprintf(stderr, "Failed to find global_rst_pkt_counter\n");
+        return -1;
+    }
+    if (clear_pkt_counter_map(global_rst_pkt_counter_fd) < 0)
+        return -1;
+    printf("global_rst_pkt_counter is cleared\n"); 
+
+    rst_counter_fixed_fd = bpf_object__find_map_fd_by_name(obj, "rst_counter_fixed");
+    if (rst_counter_fixed_fd < 0) {
+        fprintf(stderr, "Failed to find rst_counter_fixed\n");
+        return -1;
+    }
+    if (clear_batch_map(rst_counter_fixed_fd) < 0)
+        return -1;
+    printf("rst_counter_fixed is cleared\n");
+
+    burst_rst_state_fd = bpf_object__find_map_fd_by_name(obj, "burst_rst_state");
+    if (burst_rst_state_fd < 0) {
+        fprintf(stderr, "Failed to find burst_rst_state\n");
+        return -1;
+    }
+    if (clear_batch_map(burst_rst_state_fd) < 0)
+        return -1;
+    printf("burst_rst_state is cleared\n");
+
+    int global_icmp_pkt_counter_fd, icmp_counter_fixed_fd, burst_icmp_state_fd;
+    global_icmp_pkt_counter_fd = bpf_object__find_map_fd_by_name(obj, "global_icmp_pkt_counter");
+    if (global_icmp_pkt_counter_fd < 0) {
+        fprintf(stderr, "Failed to find global_icmp_pkt_counter\n");
+        return -1;
+    }
+    if (clear_pkt_counter_map(global_icmp_pkt_counter_fd) < 0)
+        return -1;
+    printf("global_icmp_pkt_counter is cleared\n");
+
+    icmp_counter_fixed_fd = bpf_object__find_map_fd_by_name(obj, "icmp_counter_fixed");
+    if (icmp_counter_fixed_fd < 0) {
+        fprintf(stderr, "Failed to find icmp_counter_fixed\n");
+        return -1;
+    }
+    if (clear_batch_map(icmp_counter_fixed_fd) < 0)
+        return -1;
+    printf("icmp_counter_fixed is cleared\n");
+
+    burst_icmp_state_fd = bpf_object__find_map_fd_by_name(obj, "burst_icmp_state");
+    if (burst_icmp_state_fd < 0) {
+        fprintf(stderr, "Failed to find burst_icmp_state\n");
+        return -1;
+    }
+    if (clear_batch_map(burst_icmp_state_fd) < 0)
+        return -1;
+    printf("burst_icmp_state is cleared\n");
+
+    int global_udp_pkt_counter_fd, udp_counter_fixed_fd, burst_udp_state_fd;
+    global_udp_pkt_counter_fd = bpf_object__find_map_fd_by_name(obj, "global_udp_pkt_counter");
+    if (global_udp_pkt_counter_fd < 0) {
+        fprintf(stderr, "Failed to find global_udp_pkt_counter\n");
+        return -1;
+    }
+    if (clear_pkt_counter_map(global_udp_pkt_counter_fd) < 0)
+        return -1;
+    printf("global_udp_pkt_counter is cleared\n");
+
+    udp_counter_fixed_fd = bpf_object__find_map_fd_by_name(obj, "udp_counter_fixed");
+    if (udp_counter_fixed_fd < 0) {
+        fprintf(stderr, "Failed to find udp_counter_fixed\n");
+        return -1;
+    }
+    if (clear_batch_map(udp_counter_fixed_fd) < 0)
+        return -1;
+    printf("udp_counter_fixed is cleared\n");
+
+    burst_udp_state_fd = bpf_object__find_map_fd_by_name(obj, "burst_udp_state");
+    if (burst_udp_state_fd < 0) {
+        fprintf(stderr, "Failed to find burst_udp_state\n");
+        return -1;
+    }
+    if (clear_batch_map(burst_udp_state_fd) < 0)
+        return -1;
+    printf("burst_udp_state is cleared\n");
+
+    int global_gre_pkt_counter_fd, gre_counter_fixed_fd, burst_gre_state_fd;
+    global_gre_pkt_counter_fd = bpf_object__find_map_fd_by_name(obj, "global_gre_pkt_counter");
+    if (global_gre_pkt_counter_fd < 0) {
+        fprintf(stderr, "Failed to find global_gre_pkt_counter\n");
+        return -1;
+    }
+    if (clear_pkt_counter_map(global_gre_pkt_counter_fd) < 0)
+        return -1;
+    printf("global_gre_pkt_counter is cleared\n");
+
+    gre_counter_fixed_fd = bpf_object__find_map_fd_by_name(obj, "gre_counter_fixed");
+    if (gre_counter_fixed_fd < 0) {
+        fprintf(stderr, "Failed to find gre_counter_fixed\n");
+        return -1;
+    }
+    if (clear_batch_map(gre_counter_fixed_fd) < 0)
+        return -1;
+    printf("gre_counter_fixed is cleared\n");
+
+    burst_gre_state_fd = bpf_object__find_map_fd_by_name(obj, "burst_gre_state");
+    if (burst_gre_state_fd < 0) {
+        fprintf(stderr, "Failed to find burst_gre_state\n");
+        return -1;
+    }
+    if (clear_batch_map(burst_gre_state_fd) < 0)
+        return -1;
+    printf("burst_gre_state is cleared\n");
+
+    return 0;
 }

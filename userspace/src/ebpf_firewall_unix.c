@@ -34,15 +34,19 @@ static void handle_restart_fw(int cfd, char **argv, int argc) {
     if (ret == -1 ) {
         reply(cfd, "Failed! FW restarted failed\n");
     } else {
-        reply(cfd, "OK! FW restarted correctly\n");
+        reply(cfd, "OK! FW restarted\n");
     }
 }
 
 static void handle_clear_fw(int cfd, char **argv, int argc) {
-    (void)argv; (void)argc;
-    // TODO
-
-    reply(cfd, "OK stats cleared\n");
+    //(void)argv; (void)argc;
+    int ret = -1;
+    ret = clear_fw();
+    if (ret == -1) {
+        reply(cfd, "Failed! FW clear stats failed\n");
+    } else {
+        reply(cfd, "OK! FW clear stats\n");
+    }
 }
 
 static void handle_stats_fw(int cfd, char **argv, int argc) {

@@ -2,5 +2,6 @@
 #define EBPF_FIREWALL_CORE_H
 
 int restart_fw();
+int clear_fw();
 
 #endif

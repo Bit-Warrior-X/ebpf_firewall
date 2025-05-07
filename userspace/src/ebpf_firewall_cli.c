@@ -49,14 +49,23 @@ static int send_and_print(const char *msg) {
     if (write(fd, msg, len) != (ssize_t)len) { perror("write"); close(fd); return 2; }
 
     char buf[BUF_SZ];
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        fputs(buf, stdout);
-    } else if (n == 0) {
-        fputs("(no reply)\n", stdout);
-    } else {
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n > 0) {
+            if (fwrite(buf, 1, (size_t)n, stdout) != (size_t)n) {
+                perror("fwrite");
+                close(fd);
+                return 2;
+            }
+            continue;
+        }
+        if (n == 0)
+            break;
+        if (errno == EINTR)
+            continue;
         perror("read");
+        close(fd);
+        return 2;
     }
     close(fd);
     return 0;

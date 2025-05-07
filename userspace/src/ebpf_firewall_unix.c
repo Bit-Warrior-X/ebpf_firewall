@@ -10,11 +10,13 @@
 #include <ebpf_firewall_unix.h>
 #include <ebpf_firewall_core.h>
 
-#define BUF_SZ    1024
+
 
 static int srv_fd = -1;
 extern int exiting;
 
+#define BUF_SZ    1024
+#if 0
 static void reply(int cfd, const char *fmt, ...) {
     char buf[BUF_SZ];
     va_list ap;
@@ -23,6 +25,59 @@ static void reply(int cfd, const char *fmt, ...) {
     va_end(ap);
     if (n < 0 || n >= (int)sizeof buf || write(cfd, buf, (size_t)n) != n)
         fprintf(stderr, "short write when replying\n");
+}
+#endif
+
+static void reply(int cfd, const char *fmt, ...)
+{
+    char   stack_buf[BUF_SZ];
+    char  *out      = stack_buf;   /* will point to the final buffer */
+    size_t out_sz   = BUF_SZ;      /* size of *out */
+    int    need;                   /* bytes required (without '\0') */
+
+    /* ------------ first try to format into the stack buffer ------------ */
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);              /* we may need a second pass */
+
+    need = vsnprintf(stack_buf, out_sz, fmt, ap);
+    if (need < 0) {                /* encoding error */
+        va_end(ap); va_end(ap2);
+        fprintf(stderr, "vsnprintf failed in reply()\n");
+        return;
+    }
+    if ((size_t)need >= out_sz) {  /* buffer too small → allocate */
+        out_sz = (size_t)need + 1;             /* +1 for terminator */
+        out = malloc(out_sz);
+        if (!out) {
+            va_end(ap); va_end(ap2);
+            fprintf(stderr, "reply: OOM\n");
+            return;
+        }
+        /* re‑format with the copied va_list */
+        need = vsnprintf(out, out_sz, fmt, ap2);
+    }
+    va_end(ap); va_end(ap2);
+
+    /* ------------------ write all bytes, handling short writes --------- */
+    size_t sent = 0;
+    while (sent < (size_t)need) {
+        ssize_t n = write(cfd, out + sent, (size_t)need - sent);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;          /* interrupted → retry */
+            fprintf(stderr, "reply: write failed: %s\n", strerror(errno));
+            break;
+        }
+        if (n == 0) {              /* should not happen on regular fds */
+            fprintf(stderr, "reply: unexpected EOF on fd %d\n", cfd);
+            break;
+        }
+        sent += (size_t)n;
+    }
+
+    if (out != stack_buf)
+        free(out);
 }
 
 /* ---------- stub command handlers -------------------------------------- */
@@ -65,9 +120,18 @@ static void handle_stats_fw(int cfd, char **argv, int argc) {
 
 static void handle_list_ip(int cfd, char **argv, int argc) {
     (void)argv; (void)argc;
-    // TODO
-    reply(cfd, "OK (no IPs blacklisted yet)\n");
+    int ret = -1;
+    char * data = NULL;
+
+    ret = list_ip(&data);
+    if (ret == -1) {
+        reply(cfd, "Failed! List IP is failed\n");    
+    } else {
+        reply(cfd, "OK\n%s\n", data);
+    }
+    if (data) free (data);
 }
+
 
 static void handle_clear_ip(int cfd, char **argv, int argc) {
     if (argc != 2) { reply(cfd, "ERR usage: CLEAR_IP <ip>\n"); return; }

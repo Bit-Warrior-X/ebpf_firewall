@@ -254,9 +254,10 @@ static void * global_attack_check_worker(void * arg) {
             need_to_update = true;
         }
 
-
         if (need_to_update == true)
             bpf_map_update_elem(global_attack_stats_map_fd, &key, &global_attack_stats_val, 0);
+
+        // Check blocked_ips duration
 
         sleep (1);
     }
@@ -964,7 +965,7 @@ int stats_fw(struct stats_config * stats)
 
     int global_syn_pkt_counter_map_fd, global_ack_pkt_counter_map_fd, global_rst_pkt_counter_map_fd, global_icmp_pkt_counter_map_fd, global_udp_pkt_counter_map_fd, global_gre_pkt_counter_map_fd;
     __u32 key = 0;
-    
+
     global_syn_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_syn_pkt_counter");
     if (global_syn_pkt_counter_map_fd < 0) {
         fprintf(stderr, "Failed to find global_syn_pkt_counter eBPF map\n");
@@ -1071,5 +1072,127 @@ int stats_fw(struct stats_config * stats)
 
 error:
     if (values) free (values);
+    return -1;
+}
+
+static int sb_append(char **buf, size_t *off, size_t *cap,
+                     const char *fmt, ...)
+{
+    for (;;) {
+        va_list ap;
+        va_start(ap, fmt);
+        int n = vsnprintf(*buf + *off, *cap - *off, fmt, ap);
+        va_end(ap);
+
+        if (n < 0)
+            return -1;                           /* encoding error */
+
+        if ((size_t)n < *cap - *off) {           /* fit */
+            *off += n;
+            return n;
+        }
+        /* need more space → double the buffer (or add n+1, whichever larger) */
+        size_t new_cap = (*cap * 2 > *off + n + 1) ? *cap * 2 : *off + n + 1;
+        char *tmp = realloc(*buf, new_cap);
+        if (!tmp)
+            return -1;                           /* OOM */
+        *buf = tmp;
+        *cap = new_cap;
+    }
+}
+
+static inline __u64 now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+int list_ip(char **out) {
+    *out = NULL;
+    size_t off = 0, cap = 1024;          /* start with 1 kB, grow as needed */
+    char *buf = malloc(cap);
+    if (!buf)
+        return -1;
+
+    struct bpf_map_info info = {};
+    __u32 len = sizeof(info);
+
+    int blocked_ips_fd;
+    blocked_ips_fd = bpf_object__find_map_fd_by_name(obj, "blocked_ips");
+    if (blocked_ips_fd < 0) {
+        fprintf(stderr, "Failed to find blocked_ips\n");
+        goto error;
+    }
+
+    if (bpf_obj_get_info_by_fd(blocked_ips_fd, &info, &len)) {
+        fprintf(stderr, "bpf_obj_get_info_by_fd");
+        goto error;
+    }
+
+    printf("‑‑ Map fd=%d  type=%u  max_entries=%u  key=%uB  value=%uB\n",
+            blocked_ips_fd, info.type, info.max_entries, info.key_size, info.value_size);
+            
+    void *key  = calloc(1, info.key_size);
+    void *next = calloc(1, info.key_size);
+    void *val  = malloc(info.value_size);
+
+    if (!key || !next || !val) {
+        fprintf(stderr, "Failed to malloc\n");
+        goto error;
+    }
+
+    /* First call with NULL to get the first key (if any) */
+    if (bpf_map_get_next_key(blocked_ips_fd, NULL, next)) {
+        sb_append(&buf, &off, &cap, "(No ip address in blacklist)\n");
+        goto done;           /* map empty */
+    }
+
+    const __u64 t_now = now_ns();
+    char ip_str[INET_ADDRSTRLEN];
+    char ts_str[32];
+
+    do {
+        if (bpf_map_lookup_elem(blocked_ips_fd, next, val)) {
+            goto error;
+        }
+
+        /* key → dotted‑quad -------------------------------------------------- */
+        struct in_addr addr = { .s_addr = *(__u32 *)next };   /* network order */
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+
+        /* value is absolute expiration time in ns ---------------------------- */
+        __u64 exp_ns = *(__u64 *)val;
+        double remain = exp_ns > t_now ? (double)(exp_ns - t_now) / 1e9 : 0.0;
+
+        /* ---------- NEW: convert ns → human timestamp -------------------- */
+        __u64 real_time_ns = exp_ns + time_offset_ns;
+        /* Apply timezone offset (CST = UTC+8) */
+        real_time_ns += tz_offset_sec * ONE_SECOND_NS;
+        time_t seconds = real_time_ns / ONE_SECOND_NS;
+
+        struct tm tm_info;
+        if (localtime_r(&seconds, &tm_info) == NULL) {
+            fprintf(stderr, "localtime_r error\n");
+            goto error;
+        }
+
+        strftime(ts_str, sizeof ts_str, "%Y-%m-%d %H:%M:%S", &tm_info);
+        printf("IP %-15s  expires_at=%s  (~%.3f s left)\n",
+           ip_str, ts_str, remain);
+
+        if (sb_append(&buf, &off, &cap,"IP %-15s  expires_at=%s  (~%.3f s left)\n",ip_str, ts_str, remain) < 0)
+            goto error;
+
+        memcpy(key, next, info.key_size);
+    } while (!bpf_map_get_next_key(blocked_ips_fd, key, next));
+
+done:
+    free(key); free(next); free(val);
+    *out = buf;
+    return 0;
+
+error:
+    free(key); free(next); free(val);
     return -1;
 }

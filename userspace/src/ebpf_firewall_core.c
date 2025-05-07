@@ -963,7 +963,8 @@ int stats_fw(struct stats_config * stats)
     }
 
     int global_syn_pkt_counter_map_fd, global_ack_pkt_counter_map_fd, global_rst_pkt_counter_map_fd, global_icmp_pkt_counter_map_fd, global_udp_pkt_counter_map_fd, global_gre_pkt_counter_map_fd;
-
+    __u32 key = 0;
+    
     global_syn_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_syn_pkt_counter");
     if (global_syn_pkt_counter_map_fd < 0) {
         fprintf(stderr, "Failed to find global_syn_pkt_counter eBPF map\n");

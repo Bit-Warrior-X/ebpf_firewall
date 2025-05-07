@@ -3,5 +3,6 @@
 
 int restart_fw();
 int clear_fw();
+int stats_fw(struct stats_config * stats);
 
 #endif

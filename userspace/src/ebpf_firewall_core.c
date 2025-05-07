@@ -946,3 +946,129 @@ int clear_fw() {
 
     return 0;
 }
+
+int stats_fw(struct stats_config * stats)
+{
+    size_t vsize = sizeof(__u64) * n_cpus;
+    __u64 *values = calloc(n_cpus, sizeof(__u64));
+
+    if (stats == NULL) {
+        fprintf(stderr, "stats parameter is NULL\n");
+        goto error;
+    }
+
+    if (values == NULL) {
+        fprintf(stderr, "Failed to calloc memory\n");
+        goto error;
+    }
+
+    int global_syn_pkt_counter_map_fd, global_ack_pkt_counter_map_fd, global_rst_pkt_counter_map_fd, global_icmp_pkt_counter_map_fd, global_udp_pkt_counter_map_fd, global_gre_pkt_counter_map_fd;
+
+    global_syn_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_syn_pkt_counter");
+    if (global_syn_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_syn_pkt_counter eBPF map\n");
+        goto error;
+    }
+
+    global_ack_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_ack_pkt_counter");
+    if (global_ack_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_ack_pkt_counter eBPF map\n");
+        goto error;
+    }
+
+    global_rst_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_rst_pkt_counter");
+    if (global_rst_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_rst_pkt_counter eBPF map\n");
+        goto error;
+    }
+
+    global_icmp_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_icmp_pkt_counter");
+    if (global_icmp_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_icmp_pkt_counter eBPF map\n");
+        goto error;
+    }
+
+    global_udp_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_udp_pkt_counter");
+    if (global_udp_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_udp_pkt_counter eBPF map\n");
+        goto error;
+    }
+
+    global_gre_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_gre_pkt_counter");
+    if (global_gre_pkt_counter_map_fd < 0) {
+        fprintf(stderr, "Failed to find global_gre_pkt_counter eBPF map\n");
+        goto error;
+    }
+
+    __u64 total_syn_cnt = 0;
+    if (bpf_map_lookup_elem(global_syn_pkt_counter_map_fd, &key, values)) {
+        fprintf(stderr, "bpf_map_lookup_elem");
+        goto error;
+    }
+    for (int cpu = 0; cpu < n_cpus; cpu++) {
+        total_syn_cnt += values[cpu];
+    }
+
+    memset(values, 0, vsize);
+    __u64 total_ack_cnt = 0;
+    if (bpf_map_lookup_elem(global_ack_pkt_counter_map_fd, &key, values)) {
+        fprintf(stderr, "bpf_map_lookup_elem");
+        goto error;
+    }
+    for (int cpu = 0; cpu < n_cpus; cpu++) {
+        total_ack_cnt += values[cpu];
+    }
+
+    memset(values, 0, vsize);
+    __u64 total_rst_cnt = 0;
+    if (bpf_map_lookup_elem(global_rst_pkt_counter_map_fd, &key, values)) {
+        fprintf(stderr, "bpf_map_lookup_elem");
+        goto error;
+    }
+    for (int cpu = 0; cpu < n_cpus; cpu++) {
+        total_rst_cnt += values[cpu];
+    }
+
+    memset(values, 0, vsize);
+    __u64 total_icmp_cnt = 0;
+    if (bpf_map_lookup_elem(global_icmp_pkt_counter_map_fd, &key, values)) {
+        fprintf(stderr, "bpf_map_lookup_elem");
+        goto error;
+    }
+    for (int cpu = 0; cpu < n_cpus; cpu++) {
+        total_icmp_cnt += values[cpu];
+    }
+
+    memset(values, 0, vsize);
+    __u64 total_udp_cnt = 0;
+    if (bpf_map_lookup_elem(global_udp_pkt_counter_map_fd, &key, values)) {
+        fprintf(stderr, "bpf_map_lookup_elem");
+        goto error;
+    }
+    for (int cpu = 0; cpu < n_cpus; cpu++) {
+        total_udp_cnt += values[cpu];
+    }
+
+    memset(values, 0, vsize);
+    __u64 total_gre_cnt = 0;
+    if (bpf_map_lookup_elem(global_gre_pkt_counter_map_fd, &key, values)) {
+        fprintf(stderr, "bpf_map_lookup_elem");
+        goto error;
+    }
+    for (int cpu = 0; cpu < n_cpus; cpu++) {
+        total_gre_cnt += values[cpu];
+    }
+
+    stats->syn = total_syn_cnt;
+    stats->ack = total_ack_cnt;
+    stats->rst = total_rst_cnt;
+    stats->icmp = total_icmp_cnt;
+    stats->udp = total_udp_cnt;
+    stats->gre = total_gre_cnt;
+
+    return 0;
+
+error:
+    if (values) free (values);
+    return -1;
+}

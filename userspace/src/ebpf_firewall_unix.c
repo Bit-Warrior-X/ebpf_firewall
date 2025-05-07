@@ -51,8 +51,16 @@ static void handle_clear_fw(int cfd, char **argv, int argc) {
 
 static void handle_stats_fw(int cfd, char **argv, int argc) {
     (void)argv; (void)argc;
-    // TODO: gather real stats
-    reply(cfd, "OK SYN=0 ACK=0 RST=0 ICMP=0 UDP=0 GRE=0\n");
+    int ret = -1;
+    struct stats_config stats_config_val = {0};
+    ret = stats_fw(&stats_config_val);
+    if (ret == -1) {
+        reply(cfd, "Failed! FW stats failed\n");    
+    } else {
+        reply(cfd, "OK SYN=%d ACK=%d RST=%d ICMP=%d UDP=%d GRE=%d\n", 
+            stats_config_val.syn, stats_config_val.ack, stats_config_val.rst, 
+            stats_config_val.icmp, stats_config_val.udp, stats_config_val.gre);
+    }
 }
 
 static void handle_list_ip(int cfd, char **argv, int argc) {

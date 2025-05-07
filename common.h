@@ -205,12 +205,13 @@ struct icmphdr
   } un;
 };
 
-struct tcp_session {
-    __u32 src_ip;    // in network byte order
-    __u16 src_port;  // in network byte order
-    __u32 dst_ip;    // in network byte order
-    __u16 dst_port;  // in network byte order
-} __attribute__((packed));
-
+struct stats_config {
+    __u64 syn;
+    __u64 ack;
+    __u64 rst;
+    __u64 icmp;
+    __u64 udp;
+    __u64 gre;
+}
 
 #endif

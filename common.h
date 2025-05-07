@@ -212,6 +212,6 @@ struct stats_config {
     __u64 icmp;
     __u64 udp;
     __u64 gre;
-}
+};
 
 #endif

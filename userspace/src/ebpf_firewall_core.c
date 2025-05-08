@@ -258,7 +258,7 @@ static void * global_attack_check_worker(void * arg) {
             bpf_map_update_elem(global_attack_stats_map_fd, &key, &global_attack_stats_val, 0);
 
         // Check blocked_ips duration
-
+        
         sleep (1);
     }
 
@@ -568,7 +568,7 @@ int restart_fw() {
     return ret;
 }
 
-#if 0
+
 /* -------------------------------------------------------------- */
 /* Core: count elements in map_fd, independent of key/value sizes */
 static long count_map(int map_fd)
@@ -639,7 +639,7 @@ done:
     return total;
 #endif
 }
-#endif
+
 
 static int clear_batch_map(int map_fd)
 {   
@@ -735,19 +735,6 @@ static int clear_global_attack_stats_map(int map_fd) {
 }
 
 int clear_fw() {
-#if 0
-    int blocked_ips_fd;
-    blocked_ips_fd = bpf_object__find_map_fd_by_name(obj, "blocked_ips");
-    if (blocked_ips_fd < 0) {
-        fprintf(stderr, "Failed to find blocked_ips\n");
-        return -1;
-    }
-    printf("total registered count is %d\n", count_map(blocked_ips_fd));
-    if (clear_batch_map(blocked_ips_fd) < 0)
-        return -1;
-    printf("blocked_ips_fd is cleared\n");
-    printf("After clear total registered count is %d\n", count_map(blocked_ips_fd));
-#endif
     int tcp_established_map_fd, global_attack_stats_map_fd;
 
     tcp_established_map_fd = bpf_object__find_map_fd_by_name(obj, "tcp_established_map");
@@ -1195,4 +1182,70 @@ done:
 error:
     free(key); free(next); free(val);
     return -1;
+}
+
+int clear_ip(char * ip) {
+    int blocked_ips_fd;
+    blocked_ips_fd = bpf_object__find_map_fd_by_name(obj, "blocked_ips");
+    if (blocked_ips_fd < 0) {
+        fprintf(stderr, "Failed to find blocked_ips\n");
+        return -1;
+    }
+    __u32 key;
+    if (inet_pton(AF_INET, ip, &key) != 1) {
+        fprintf(stderr, "Invalid IP address: %s\n", ip);
+        return -1;
+    }
+
+    int err = bpf_map_delete_elem(blocked_ips_fd, &key);
+    if (err) {
+        perror("Failed to delete element from map");
+        return err;
+    }
+    return 0;
+}
+
+int clear_ip_all() {
+    int blocked_ips_fd;
+    blocked_ips_fd = bpf_object__find_map_fd_by_name(obj, "blocked_ips");
+    if (blocked_ips_fd < 0) {
+        fprintf(stderr, "Failed to find blocked_ips\n");
+        return -1;
+    }
+    if (clear_batch_map(blocked_ips_fd) < 0)
+        return -1;
+    printf("blocked_ips_fd is cleared\n");
+    return 0;
+}
+
+
+int add_ip(char *ip, int seconds) {
+    __u64 expire_duration = (seconds == 0) 
+                          ? now_ns() + gcfg.black_ip_duration 
+                          : now_ns() + seconds * ONE_SECOND_NS;
+
+    
+    __u32 key;
+    if (inet_pton(AF_INET, ip, &key) != 1) {
+        fprintf(stderr, "Invalid IP address: %s\n", ip);
+        return -1;
+    }
+
+    int blocked_ips_fd;
+    blocked_ips_fd = bpf_object__find_map_fd_by_name(obj, "blocked_ips");
+    if (blocked_ips_fd < 0) {
+        fprintf(stderr, "Failed to find blocked_ips\n");
+        return -1;
+    }
+    
+    __u64 existing_val;
+    bool is_new_entry = (bpf_map_lookup_elem(blocked_ips_fd, &key, &existing_val) != 0);
+
+    int err = bpf_map_update_elem(blocked_ips_fd, &key, &expire_duration, BPF_ANY);
+    if (err) {
+        perror("Failed to update map");
+        return err;
+    }
+
+    return is_new_entry ? 0 : 1;
 }

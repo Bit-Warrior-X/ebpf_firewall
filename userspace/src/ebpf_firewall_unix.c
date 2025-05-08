@@ -135,14 +135,27 @@ static void handle_list_ip(int cfd, char **argv, int argc) {
 
 static void handle_clear_ip(int cfd, char **argv, int argc) {
     if (argc != 2) { reply(cfd, "ERR usage: CLEAR_IP <ip>\n"); return; }
-    // TODO
-    reply(cfd, "OK %s removed\n", argv[1]);
+    int ret = -1;
+
+    ret = clear_ip(argv[1]);
+    if (ret == 0) {
+        reply(cfd, "OK %s removed\n", argv[1]);
+    } else if (ret == -ENOENT){
+        reply(cfd, "OK! But ip %s was not registered\n", argv[1]);
+    } else {
+        reply(cfd, "Failed! Clear IP %s is failed\n", argv[1]);
+    }
 }
 
 static void handle_clear_ip_all(int cfd, char **argv, int argc) {
     (void)argv; (void)argc;
-    // TODO
-    reply(cfd, "OK all IPs removed\n");
+    int ret = -1;
+    ret = clear_ip_all();
+    if (ret == 0) {
+        reply(cfd, "OK! Cleared all ips from blacklist\n", argv[1]);
+    } else {
+        reply(cfd, "Failed! Clear all black ips failed\n");
+    }
 }
 
 static void handle_add_ip(int cfd, char **argv, int argc) {
@@ -150,9 +163,22 @@ static void handle_add_ip(int cfd, char **argv, int argc) {
         reply(cfd, "ERR usage: ADD_IP <ip> [seconds]\n"); return;
     }
     const char *ip = argv[1];
-    int secs = (argc == 3) ? atoi(argv[2]) : 600; // default 10 min
-    // TODO
-    reply(cfd, "OK %s blacklisted for %d s\n", ip, secs);
+    int secs = (argc == 3) ? atoi(argv[2]) : 0; // default duration
+
+    if (secs < 0) {
+        reply(cfd, "Failed! Duration should be greater than 0 seconds\n");
+        return;
+    }
+
+    int ret = -1;
+    ret = add_ip(argv[1], secs);
+    if (ret == 0)
+        reply(cfd, "OK %s blacklisted for %d s\n", ip, secs);
+    else if (ret == 1) {
+        reply(cfd, "OK %s is overwritten and set blacklisted for %d s\n", ip, secs);
+    } else {
+        reply(cfd, "Failed! Add %s to blacklist is failed\n", ip);
+    }
 }
 
 /* Table‐driven dispatch */

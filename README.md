@@ -1,10 +1,10 @@
-# Bit-Warrior-X eBPF Firewall
+# eBPF Firewall
 
 A high-performance Linux kernel-based anti-DDoS firewall leveraging XDP (eXpress Data Path) and eBPF (extended Berkeley Packet Filter) technology.
 
 ## Overview
 
-Bit-Warrior-X eBPF Firewall is designed to detect and mitigate various network flood attacks directly in the Linux kernel, providing exceptional performance with minimal overhead. By operating at the XDP layer, it can process packets before they reach the regular network stack, making it highly efficient for DDoS protection.
+eBPF Firewall is designed to detect and mitigate various network flood attacks directly in the Linux kernel, providing exceptional performance with minimal overhead. By operating at the XDP layer, it can process packets before they reach the regular network stack, making it highly efficient for DDoS protection.
 
 ## Features
 

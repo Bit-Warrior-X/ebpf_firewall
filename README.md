@@ -1,2 +1,103 @@
-# ebpf_firewall
-Linux based Anti-DDOS kernel Firewall using xdp/eBPF technology
+# Bit-Warrior-X eBPF Firewall
+
+A high-performance Linux kernel-based anti-DDoS firewall leveraging XDP (eXpress Data Path) and eBPF (extended Berkeley Packet Filter) technology.
+
+## Overview
+
+Bit-Warrior-X eBPF Firewall is designed to detect and mitigate various network flood attacks directly in the Linux kernel, providing exceptional performance with minimal overhead. By operating at the XDP layer, it can process packets before they reach the regular network stack, making it highly efficient for DDoS protection.
+
+## Features
+
+- **High Performance**: Operates at the XDP layer for efficient packet processing
+- **Multiple Attack Vector Protection**:
+  - TCP SYN flood protection
+  - TCP ACK flood protection
+  - TCP RST flood protection
+  - ICMP flood protection
+  - UDP flood protection
+  - GRE flood protection
+- **Intelligent Detection Mechanisms**:
+  - Rate limiting
+  - Burst detection
+  - Fixed window thresholds
+- **Automatic IP Blocking**: Temporarily blocks malicious sources
+- **Configurable**: Easy customization via configuration file
+- **Minimal Resource Usage**: Operates in the kernel without userspace packet handling
+
+## Requirements
+
+- Linux kernel 5.10+ (with XDP support)
+- LLVM and Clang for compiling eBPF programs
+- libxdp-dev
+- libbpf-dev
+- libnetfilter-conntrack-dev
+
+## Installation
+
+1. Ensure you have the required dependencies:
+   ```bash
+   apt install clang llvm libelf-dev libbpf-dev xdp-tools libnetfilter-conntrack-dev
+   ```
+
+2. Clone the repository:
+   ```bash
+   git clone https://github.com/bit-warrior-x/ebpf_firewall.git
+   cd ebpf_firewall
+   ```
+
+3. Configure the firewall by editing `firewall.config`:
+   ```bash
+   nano firewall.config
+   ```
+
+4. Build and attach the XDP program:
+   ```bash
+   ./start.sh
+   ```
+
+## Configuration
+
+The `firewall.config` file allows customization of various parameters:
+
+```
+#------------------GLOBAL-------------------
+dev = eth0                    # Network interface to attach to
+attach_mode = drv            # XDP attachment mode (skb, native, drv, hw)
+black_ip_duration = 3600     # Duration in seconds to block malicious IPs
+
+#------------------SYN-----------------------
+syn_threshold = 200000       # Packets per second threshold
+syn_burst_pkt = 20           # Packets per burst threshold
+syn_burst_count_per_sec = 10 # Burst count threshold per second
+syn_fixed_threshold = 2000   # Fixed window threshold
+syn_fixed_check_duration = 15 # Fixed window duration in seconds
+challenge_timeout = 3        # SYN challenge timeout
+
+# ... similar configurations for ACK, RST, ICMP, UDP, and GRE
+```
+
+## How It Works
+
+The firewall operates using eBPF programs attached to the XDP hook, which intercept packets at the earliest possible point in the network stack. Key components:
+
+1. **Packet Inspection**: Analyzes incoming packets for suspicious patterns
+2. **Rate Limiting**: Tracks packet rates from source IPs
+3. **Burst Detection**: Identifies traffic bursts characteristic of DDoS attacks
+4. **Blocking Mechanism**: Temporarily blocks IPs identified as attack sources
+
+Each attack vector (SYN, ACK, RST, ICMP, UDP, GRE) has dedicated detection and mitigation logic.
+
+## Removing the Firewall
+
+To detach the XDP program from the network interface:
+```bash
+./remove.sh
+```
+
+## License
+
+This project is licensed under the GPL License - see the LICENSE file for details.
+
+## Contributing
+
+Contributions welcome! Please feel free to submit a Pull Request.

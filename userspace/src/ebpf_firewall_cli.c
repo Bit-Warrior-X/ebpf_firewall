@@ -12,6 +12,7 @@
 
 /*
   RESTART_FW : Restart the firewall
+  RELOAD_FW : Reload the firewall config
   CLEAR_FW : Clear all packet statistics. (Reset all statistics as zero).
   STATS_FW : Display all packet information captured. (SYN, ACK, RST, ICMP UDP, GRE)
 
@@ -26,6 +27,7 @@ static void usage(void) {
 "Usage: firewall_cli COMMAND [args]\n"
 "Commands:\n"
 "  RESTART_FW : Restart the firewall\n"
+"  RELOAD_FW : Reload the firewall config\n"
 "  CLEAR_FW : Clear all packet statistics. (Reset all statistics as zero).\n"
 "  STATS_FW : Display all packet information captured. (SYN, ACK, RST, ICMP UDP, GRE)\n"
 "  LIST_IP : Dump current blacklist ip. (ip expire_ns per line)\n"

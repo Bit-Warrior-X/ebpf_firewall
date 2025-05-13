@@ -36,6 +36,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10000);
+    __uint(map_flags, BPF_F_NO_COMMON_LRU);
     __type(key, __u32);             // Source IP address.
     __type(value, __u64);           // Block expiration time (ns)
 } blocked_ips SEC(".maps");

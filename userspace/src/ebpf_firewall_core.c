@@ -27,6 +27,13 @@ extern struct icmp_config icmp_cfg;
 extern struct udp_config udp_cfg;
 extern struct gre_config gre_cfg;
 
+static inline __u64 now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 static void * global_attack_check_worker(void * arg) {
 
     size_t vsize = sizeof(__u64) * n_cpus;
@@ -257,13 +264,102 @@ static void * global_attack_check_worker(void * arg) {
         if (need_to_update == true)
             bpf_map_update_elem(global_attack_stats_map_fd, &key, &global_attack_stats_val, 0);
 
-        // Check blocked_ips duration
-        
         sleep (1);
     }
 
 cleanup:
     if (values) free (values);
+    return NULL;
+}
+
+static void *blocked_ips_duration_check_worker(void *arg) {
+    struct bpf_object *obj = (struct bpf_object*)arg;
+    if (!obj) goto cleanup;
+
+    while (1) {
+        int blocked_ips_fd = bpf_object__find_map_fd_by_name(obj, "blocked_ips");
+        if (blocked_ips_fd < 0) {
+            fprintf(stderr, "Failed to find blocked_ips\n");
+            goto cleanup;
+        }
+
+        struct bpf_map_info info = {};
+        __u32 len = sizeof(info);
+        if (bpf_obj_get_info_by_fd(blocked_ips_fd, &info, &len)) {
+            fprintf(stderr, "bpf_obj_get_info_by_fd failed\n");
+            goto cleanup;
+        }
+
+        void *key  = calloc(1, info.key_size);
+        void *next = calloc(1, info.key_size);
+        void *val  = malloc(info.value_size);
+        if (!key || !next || !val) {
+            fprintf(stderr, "Failed to allocate memory\n");
+            goto cleanup;
+        }
+
+        const __u64 t_now = now_ns();
+        char ip_str[INET_ADDRSTRLEN];
+
+        // Dynamic array for expired keys
+        void **keys_to_delete = NULL;
+        size_t delete_capacity = 0;
+        size_t delete_count = 0;
+
+        // First pass: Identify expired keys
+        while (!bpf_map_get_next_key(blocked_ips_fd, key, next)) {
+            if (bpf_map_lookup_elem(blocked_ips_fd, next, val)) {
+                break;
+            }
+
+            __u64 exp_ns = *(__u64 *)val;
+            if (exp_ns <= t_now) {
+                // Resize array if full
+                if (delete_count >= delete_capacity) {
+                    delete_capacity = delete_capacity ? delete_capacity * 2 : 16; // Start with 16, double when needed
+                    void **new_array = realloc(keys_to_delete, delete_capacity * sizeof(void *));
+                    if (!new_array) {
+                        fprintf(stderr, "Failed to realloc keys_to_delete\n");
+                        goto delete_cleanup;
+                    }
+                    keys_to_delete = new_array;
+                }
+
+                // Store the key to delete
+                keys_to_delete[delete_count] = malloc(info.key_size);
+                if (!keys_to_delete[delete_count]) {
+                    fprintf(stderr, "Failed to malloc key storage\n");
+                    goto delete_cleanup;
+                }
+                memcpy(keys_to_delete[delete_count], next, info.key_size);
+                delete_count++;
+            }
+            memcpy(key, next, info.key_size);
+        }
+
+        time_t rawtime;
+        struct tm *tm_info;
+        time(&rawtime);
+        tm_info = localtime(&rawtime);
+
+        // Second pass: Delete expired keys
+        for (size_t i = 0; i < delete_count; i++) {
+            __u32 ip = *(__u32 *)keys_to_delete[i];
+            print_firewall_status(tm_info, EVENT_IP_BLOCK_END, ip);
+            bpf_map_delete_elem(blocked_ips_fd, keys_to_delete[i]);
+            free(keys_to_delete[i]);
+        }
+
+delete_cleanup:
+        if (keys_to_delete) free(keys_to_delete);
+        if (key) free(key); 
+        if (next) free(next); 
+        if (val) free(val);
+
+        sleep(1);
+    }
+
+cleanup:
     return NULL;
 }
 
@@ -515,9 +611,14 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    pthread_t global_attack_ch_thr;
+    pthread_t global_attack_ch_thr, blocked_ips_duration_thr;
     if (pthread_create(&global_attack_ch_thr, NULL, global_attack_check_worker, obj) != 0) {
         perror("pthread_create for global_attack_ch_thr");
+        goto cleanup;
+    }
+
+    if (pthread_create(&blocked_ips_duration_thr, NULL, blocked_ips_duration_check_worker, obj) != 0) {
+        perror("pthread_create for blocked_ips_duration_thr");
         goto cleanup;
     }
 
@@ -526,7 +627,7 @@ int main(int argc, char **argv) {
 
     // Wait until terminated.
     while (!exiting) {
-        err = ring_buffer__poll(ringbuf, 100 /* timeout, ms */);
+        err = ring_buffer__poll(ringbuf, -1 /* block */);
         if (err == -EINTR) {
             err = 0;
             break;
@@ -566,6 +667,19 @@ int restart_fw() {
     }
 
     return ret;
+}
+
+int reload_fw() {
+    if (!obj) {
+        fprintf(stderr, "BPF object not loaded\n");
+        return -1;
+    }
+    if (load_config(obj) < 0) {
+        fprintf(stderr, "reload config failed\n");
+        return -1;
+    }
+    printf("Config reloaded successfully\n");
+    return 0;
 }
 
 
@@ -1086,13 +1200,6 @@ static int sb_append(char **buf, size_t *off, size_t *cap,
         *buf = tmp;
         *cap = new_cap;
     }
-}
-
-static inline __u64 now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
 int list_ip(char **out) {

@@ -83,7 +83,6 @@ static void reply(int cfd, const char *fmt, ...)
 /* ---------- stub command handlers -------------------------------------- */
 
 static void handle_restart_fw(int cfd, char **argv, int argc) {
-    //(void)argv; (void)argc;
     int ret = -1;
     ret = restart_fw();
     if (ret == -1 ) {
@@ -93,8 +92,17 @@ static void handle_restart_fw(int cfd, char **argv, int argc) {
     }
 }
 
+static void handle_reload_fw(int cfd, char **argv, int argc) {
+    int ret = -1;
+    ret = reload_fw();
+    if (ret == -1 ) {
+       reply(cfd, "Failed! Reload config failed\n");
+    } else {
+        reply(cfd, "OK! Config reloaded\n");
+    }
+}
+
 static void handle_clear_fw(int cfd, char **argv, int argc) {
-    //(void)argv; (void)argc;
     int ret = -1;
     ret = clear_fw();
     if (ret == -1) {
@@ -105,7 +113,6 @@ static void handle_clear_fw(int cfd, char **argv, int argc) {
 }
 
 static void handle_stats_fw(int cfd, char **argv, int argc) {
-    (void)argv; (void)argc;
     int ret = -1;
     struct stats_config stats_config_val = {0};
     ret = stats_fw(&stats_config_val);
@@ -119,7 +126,6 @@ static void handle_stats_fw(int cfd, char **argv, int argc) {
 }
 
 static void handle_list_ip(int cfd, char **argv, int argc) {
-    (void)argv; (void)argc;
     int ret = -1;
     char * data = NULL;
 
@@ -148,7 +154,6 @@ static void handle_clear_ip(int cfd, char **argv, int argc) {
 }
 
 static void handle_clear_ip_all(int cfd, char **argv, int argc) {
-    (void)argv; (void)argc;
     int ret = -1;
     ret = clear_ip_all();
     if (ret == 0) {
@@ -172,6 +177,7 @@ static void handle_add_ip(int cfd, char **argv, int argc) {
 
     int ret = -1;
     ret = add_ip(argv[1], secs);
+    
     if (ret == 0)
         reply(cfd, "OK %s blacklisted for %d s\n", ip, secs);
     else if (ret == 1) {
@@ -185,6 +191,7 @@ static void handle_add_ip(int cfd, char **argv, int argc) {
 struct cmd_entry { const char *name; void (*fn)(int,char**,int); };
 static const struct cmd_entry cmds[] = {
     {"RESTART_FW",  handle_restart_fw},
+    {"RELOAD_FW",   handle_reload_fw},
     {"CLEAR_FW",    handle_clear_fw},
     {"STATS_FW",    handle_stats_fw},
     {"LIST_IP",     handle_list_ip},

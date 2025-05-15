@@ -177,6 +177,18 @@ struct gre_config {
     __u64 gre_fixed_check_duration;
 };
 
+
+struct global_firewall_config {
+    struct global_attack_stats g_attack_stats;
+    struct global_config       g_config;
+    struct syn_config          g_syn_config;
+    struct ack_config          g_ack_config;
+    struct rst_config          g_rst_config;
+    struct icmp_config         g_icmp_config;
+    struct udp_config          g_udp_config;
+    struct gre_config          g_gre_config;
+};
+
 // New structure and map for the SYN challenge state.
 struct challenge_state {
     __u8 stage;       // 1: first SYN seen; 2: challenge sent (waiting for client response)

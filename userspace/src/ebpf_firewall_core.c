@@ -19,13 +19,7 @@ static void sig_handler(int signo)
     exiting = 1;
 }
 
-extern struct global_config gcfg;
-extern struct syn_config syn_cfg;
-extern struct ack_config ack_cfg;
-extern struct rst_config rst_cfg;
-extern struct icmp_config icmp_cfg;
-extern struct udp_config udp_cfg;
-extern struct gre_config gre_cfg;
+extern struct global_firewall_config global_fw_config;
 
 static inline __u64 now_ns(void)
 {
@@ -41,14 +35,14 @@ static void * global_attack_check_worker(void * arg) {
     
     struct bpf_object *obj = (struct bpf_object*)arg;
 
-    int global_attack_stats_map_fd;
     int global_syn_pkt_counter_map_fd, global_ack_pkt_counter_map_fd, global_rst_pkt_counter_map_fd, global_icmp_pkt_counter_map_fd, global_udp_pkt_counter_map_fd, global_gre_pkt_counter_map_fd;
 
-    global_attack_stats_map_fd = bpf_object__find_map_fd_by_name(obj, "global_attack_stats_map");
-    if (global_attack_stats_map_fd < 0) {
-        fprintf(stderr, "Failed to find global_attack_stats_map eBPF map\n");
+    int bss_map_fd = bpf_object__find_map_fd_by_name(obj, ".bss");
+    if (bss_map_fd < 0) {
+        fprintf(stderr, "ERROR: finding .bss map fd: %d\n", bss_map_fd);
         goto cleanup;
     }
+    
 
     global_syn_pkt_counter_map_fd = bpf_object__find_map_fd_by_name(obj, "global_syn_pkt_counter");
     if (global_syn_pkt_counter_map_fd < 0) {
@@ -91,11 +85,13 @@ static void * global_attack_check_worker(void * arg) {
         time_t now = time(NULL);     /* current epoch seconds */
         //printf("[Global statistic] check @ %s", ctime(&now));   /* ctime() adds \n */
 
-        struct global_attack_stats global_attack_stats_val;
-        if (bpf_map_lookup_elem(global_attack_stats_map_fd, &key, &global_attack_stats_val)) {
-            fprintf(stderr, "bpf_map_lookup_elem");
+        struct global_firewall_config g_fw_config = {0};
+        if (bpf_map_lookup_elem(bss_map_fd, &key, &g_fw_config) != 0) {
+            perror("bpf_map_lookup_elem");
             goto cleanup;
         }
+        
+        struct global_attack_stats * global_attack_stats_val =&g_fw_config.g_attack_stats;
         
         __u64 total_syn_cnt = 0;
         if (bpf_map_lookup_elem(global_syn_pkt_counter_map_fd, &key, values)) {
@@ -189,80 +185,81 @@ static void * global_attack_check_worker(void * arg) {
         __u8 need_to_update = false;
         __u8 syn_attack = false, ack_attack = false, rst_attack = false, icmp_attack = false, udp_attack = false, gre_attack = false;
 
-        if (total_syn_cnt >= syn_cfg.syn_threshold) syn_attack = true;
+        if (total_syn_cnt >= global_fw_config.g_syn_config.syn_threshold) syn_attack = true;
         else syn_attack = false;
-        if (syn_attack != global_attack_stats_val.syn_attack) {
+        if (syn_attack != global_attack_stats_val->syn_attack) {
             if (syn_attack == true) {
                 print_firewall_status(tm_info, EVENT_TCP_SYN_ATTACK_PROTECION_MODE_START, 0);
             } else {
                 print_firewall_status(tm_info, EVENT_TCP_SYN_ATTACK_PROTECION_MODE_END, 0);
             }
-            global_attack_stats_val.syn_attack = syn_attack;
+            global_attack_stats_val->syn_attack = syn_attack;
             need_to_update = true;
         }
 
-        if (total_ack_cnt >= ack_cfg.ack_threshold) ack_attack = true;
+        if (total_ack_cnt >= global_fw_config.g_ack_config.ack_threshold) ack_attack = true;
         else ack_attack = false;
-        if (ack_attack != global_attack_stats_val.ack_attack) {
+        if (ack_attack != global_attack_stats_val->ack_attack) {
             if (ack_attack == true) {
                 print_firewall_status(tm_info, EVENT_TCP_ACK_ATTACK_PROTECION_MODE_START, 0);
             } else {
                 print_firewall_status(tm_info, EVENT_TCP_ACK_ATTACK_PROTECION_MODE_END, 0);
             }
-            global_attack_stats_val.ack_attack = ack_attack;
+            global_attack_stats_val->ack_attack = ack_attack;
             need_to_update = true;
         }
 
-        if (total_rst_cnt >= rst_cfg.rst_threshold) rst_attack = true;
+        if (total_rst_cnt >= global_fw_config.g_rst_config.rst_threshold) rst_attack = true;
         else rst_attack = false;
-        if (rst_attack != global_attack_stats_val.rst_attack) {
+        if (rst_attack != global_attack_stats_val->rst_attack) {
             if (rst_attack == true) {
                 print_firewall_status(tm_info, EVENT_TCP_RST_ATTACK_PROTECION_MODE_START, 0);
             } else {
                 print_firewall_status(tm_info, EVENT_TCP_RST_ATTACK_PROTECION_MODE_END, 0);
             }
-            global_attack_stats_val.rst_attack = rst_attack;
+            global_attack_stats_val->rst_attack = rst_attack;
             need_to_update = true;
         }
 
-        if (total_icmp_cnt >= icmp_cfg.icmp_threshold) icmp_attack = true;
+        if (total_icmp_cnt >= global_fw_config.g_icmp_config.icmp_threshold) icmp_attack = true;
         else icmp_attack = false;
-        if (icmp_attack != global_attack_stats_val.icmp_attack) {
+        if (icmp_attack != global_attack_stats_val->icmp_attack) {
             if (icmp_attack == true) {
                 print_firewall_status(tm_info, EVENT_ICMP_ATTACK_PROTECION_MODE_START, 0);
             } else {
                 print_firewall_status(tm_info, EVENT_ICMP_ATTACK_PROTECION_MODE_END, 0);
             }
-            global_attack_stats_val.icmp_attack = icmp_attack;
+            global_attack_stats_val->icmp_attack = icmp_attack;
             need_to_update = true;
         }
 
-        if (total_udp_cnt >= udp_cfg.udp_threshold) udp_attack = true;
+        if (total_udp_cnt >= global_fw_config.g_udp_config.udp_threshold) udp_attack = true;
         else udp_attack = false;
-        if (udp_attack != global_attack_stats_val.udp_attack) {
+        if (udp_attack != global_attack_stats_val->udp_attack) {
             if (udp_attack == true) {
                 print_firewall_status(tm_info, EVENT_UDP_ATTACK_PROTECION_MODE_START, 0);
             } else {
                 print_firewall_status(tm_info, EVENT_UDP_ATTACK_PROTECION_MODE_END, 0);
             }
-            global_attack_stats_val.udp_attack = udp_attack;
+            global_attack_stats_val->udp_attack = udp_attack;
             need_to_update = true;
         }
 
-        if (total_gre_cnt >= gre_cfg.gre_threshold) gre_attack = true;
+        if (total_gre_cnt >= global_fw_config.g_gre_config.gre_threshold) gre_attack = true;
         else gre_attack = false;
-        if (gre_attack != global_attack_stats_val.gre_attack) {
+        if (gre_attack != global_attack_stats_val->gre_attack) {
             if (gre_attack == true) {
                 print_firewall_status(tm_info, EVENT_GRE_ATTACK_PROTECION_MODE_START, 0);
             } else {
                 print_firewall_status(tm_info, EVENT_GRE_ATTACK_PROTECION_MODE_END, 0);
             }
-            global_attack_stats_val.gre_attack = gre_attack;
+            global_attack_stats_val->gre_attack = gre_attack;
             need_to_update = true;
         }
-
-        if (need_to_update == true)
-            bpf_map_update_elem(global_attack_stats_map_fd, &key, &global_attack_stats_val, 0);
+        
+        if (need_to_update == true) {
+            bpf_map_update_elem(bss_map_fd, &key, &g_fw_config, BPF_ANY);
+        }
 
         sleep (1);
     }
@@ -1328,7 +1325,7 @@ int clear_ip_all() {
 
 int add_ip(char *ip, int seconds) {
     __u64 expire_duration = (seconds == 0) 
-                          ? now_ns() + gcfg.black_ip_duration 
+                          ? now_ns() + global_fw_config.g_config.black_ip_duration 
                           : now_ns() + seconds * ONE_SECOND_NS;
 
     

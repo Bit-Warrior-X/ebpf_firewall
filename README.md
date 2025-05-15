@@ -87,11 +87,24 @@ The firewall operates using eBPF programs attached to the XDP hook, which interc
 
 Each attack vector (SYN, ACK, RST, ICMP, UDP, GRE) has dedicated detection and mitigation logic.
 
-## Removing the Firewall
+## Cli commands to manage firewall
 
-To detach the XDP program from the network interface:
+Available cli commands are:
 ```bash
-./remove.sh
+RESTART_FW : Restart the firewall
+RELOAD_FW : Reload the firewall config
+CLEAR_FW : Clear all packet statistics. (Reset all statistics as zero).
+STATS_FW : Display all packet information captured. (SYN, ACK, RST, ICMP UDP, GRE)
+LIST_IP : Dump current blacklist ip. (ip expire_ns per line)
+CLEAR_IP <ip> : Remove ip from blacklist.
+CLEAR_IP_ALL : Remove all ips from blacklist.
+ADD_IP <ip> [seconds] : Add ip to blacklist. Default duration if seconds omitted.
+```
+
+Example Cli command Usage :
+```bash
+root@:# ./ebpf_firewall_cli RELOAD_FW
+OK! Config reloaded
 ```
 
 ## License

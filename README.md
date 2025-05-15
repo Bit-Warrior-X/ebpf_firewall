@@ -52,12 +52,13 @@ eBPF Firewall is designed to detect and mitigate various network flood attacks d
 
 4. Build and attach the XDP program:
    ```bash
-   ./start.sh
+   make run
    ```
 
 ## Configuration
 
 The `firewall.config` file allows customization of various parameters:
+Becareful! Firewaill use `build/firewall.config`
 
 ```
 #------------------GLOBAL-------------------
